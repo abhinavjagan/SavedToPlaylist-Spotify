@@ -57,7 +57,7 @@ def save_liked():
     sp = spotipy.Spotify(auth=token_info['access_token'])
     user_id = sp.current_user()['id']
     # Get the user's playlists
-    new_playlist = sp.user_playlist_create(user_id, 'Saved', True)
+    new_playlist = sp.user_playlist_create(user_id, 'cadence', True)
     new_playlist_id = new_playlist['id']
     temp=set()
     for i in range(28):
