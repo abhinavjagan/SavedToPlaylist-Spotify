@@ -12,4 +12,4 @@ Developed a code facilitating seamless conversion of Spotify's liked songs into 
 8. Run the Python script. In the textField, provide the necessary configuration details,the client ID, client secret. They can be found in the settings of the project created.
 9. In the browser, Log In with your mail ID linked to your Spotify account.
 10. Once you run the script, the application will run on "http://127.0.0.1:5000/config" by default.
-11. After the program runs successfully, A playlist called "saved" will be created.
+11. After the program runs successfully, A playlist called "cadence" will be created.
