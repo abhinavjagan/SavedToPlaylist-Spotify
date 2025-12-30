@@ -133,30 +133,50 @@ def progress():
     return render_template('progress.html', playlist_name=playlist_name)
 
 
-def create_playlist_job(job_id, token_info, playlist_name, playlist_public):
+def create_playlist_job(job_id, expected_user_id, token_info, playlist_name, playlist_public):
+    """
+    Create a playlist for the user using their own access token.
+    
+    Args:
+        job_id: Unique job identifier
+        expected_user_id: The Spotify user ID this job should create playlist for
+        token_info: OAuth token info containing the user's access token
+        playlist_name: Name for the new playlist
+        playlist_public: Whether playlist should be public
+    """
     try:
         JOBS[job_id]['status'] = 'working'
-        # Create Spotify instance with the provided access token
+        
+        # Create Spotify instance with the user's access token (NOT app credentials)
         sp = spotipy.Spotify(auth=token_info['access_token'])
         
-        # Get current user info to verify correct user
-        user_id = sp.current_user()['id']
-        JOBS[job_id]['user_id'] = user_id  # Store for debugging
+        # Verify we have the correct user's token
+        current_user = sp.current_user()
+        actual_user_id = current_user['id']
         
-        # Create a new playlist for this specific user
-        new_playlist = sp.user_playlist_create(user_id, playlist_name, playlist_public)
+        # SECURITY CHECK: Ensure token matches expected user
+        if actual_user_id != expected_user_id:
+            raise Exception(
+                f'Token user mismatch! Expected {expected_user_id}, got {actual_user_id}. '
+                f'This is a security issue - playlist would be created in wrong account!'
+            )
+        
+        JOBS[job_id]['user_id'] = actual_user_id
+        
+        # Create a NEW playlist in THIS user's account
+        new_playlist = sp.user_playlist_create(actual_user_id, playlist_name, playlist_public)
         new_playlist_id = new_playlist['id']
         new_playlist_url = new_playlist.get('external_urls', {}).get('spotify')
 
         JOBS[job_id]['total'] = 0
         JOBS[job_id]['progress'] = 0
 
-        # Fetch THIS USER'S liked songs (not anyone else's)
+        # Fetch THIS user's liked songs using their access token
         seen = set()
         offset = 0
         limit = 50
         while True:
-            # This fetches the CURRENT user's saved tracks based on their access token
+            # This uses the user's token, so it gets THEIR liked songs
             saved = sp.current_user_saved_tracks(limit=limit, offset=offset)
             items = saved.get('items', [])
             if not items:
@@ -168,10 +188,10 @@ def create_playlist_job(job_id, token_info, playlist_name, playlist_public):
                     seen.add(uri)
                     uris.append(uri)
             if uris:
-                # add in chunks of 100
+                # Add tracks to THIS user's playlist
                 for i in range(0, len(uris), 100):
                     chunk = uris[i:i+100]
-                    sp.user_playlist_add_tracks(user_id, new_playlist_id, chunk)
+                    sp.user_playlist_add_tracks(actual_user_id, new_playlist_id, chunk)
                     JOBS[job_id]['progress'] += len(chunk)
             offset += limit
         
@@ -179,6 +199,7 @@ def create_playlist_job(job_id, token_info, playlist_name, playlist_public):
         JOBS[job_id]['status'] = 'done'
         JOBS[job_id]['playlist_url'] = new_playlist_url
         JOBS[job_id]['playlist_name'] = playlist_name
+        
     except Exception as e:
         JOBS[job_id]['status'] = 'error'
         JOBS[job_id]['message'] = str(e)
@@ -230,14 +251,35 @@ def start_save():
     # Start background job and return job id
     try:
         token_info = get_token()
-    except Exception:
-        return jsonify({'error': 'not_logged_in'}), 401
+        user_id = session.get('user_id')
+        
+        if not user_id:
+            # If user_id not in session, get it from the token
+            sp = spotipy.Spotify(auth=token_info['access_token'])
+            user_id = sp.current_user()['id']
+            session['user_id'] = user_id
+            
+    except Exception as e:
+        return jsonify({'error': 'not_logged_in', 'message': str(e)}), 401
 
     playlist_name = session.get('playlist_name', 'cadence')
     playlist_public = session.get('playlist_public', True)
     job_id = str(uuid.uuid4())
-    JOBS[job_id] = {'status': 'pending', 'progress': 0, 'total': None}
-    thread = threading.Thread(target=create_playlist_job, args=(job_id, token_info, playlist_name, playlist_public))
+    
+    # Store user_id with the job so we can track it
+    JOBS[job_id] = {
+        'status': 'pending', 
+        'progress': 0, 
+        'total': None,
+        'user_id': user_id,  # Track which user this job is for
+        'created_at': int(time.time())
+    }
+    
+    # Pass user_id explicitly to the job
+    thread = threading.Thread(
+        target=create_playlist_job, 
+        args=(job_id, user_id, token_info, playlist_name, playlist_public)
+    )
     thread.start()
     return jsonify({'job_id': job_id})
 
