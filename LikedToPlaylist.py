@@ -20,6 +20,9 @@ if not CLIENT_ID or not CLIENT_SECRET:
 
 app = Flask(__name__)
 app.config['SESSION_COOKIE_NAME'] = 'Spotify Cookie'
+app.config['SESSION_COOKIE_SECURE'] = os.getenv('FLASK_ENV') == 'production'
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.secret_key = os.getenv('SECRET_KEY') or os.urandom(24)
 TOKEN_INFO = 'token_info'
 
@@ -261,4 +264,5 @@ def create_spotify_oauth(client_id=None, client_secret=None):
     )
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    debug_mode = os.getenv('FLASK_ENV') != 'production'
+    app.run(debug=debug_mode)
