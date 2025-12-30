@@ -55,6 +55,11 @@ def get_refresh_token(user_id):
 
 init_db()
 
+# Root route - redirect to start
+@app.route('/')
+def index():
+    return redirect(url_for('start'))
+
 # Route to display the form for entering client_id and client_secret
 @app.route('/config', methods=['GET', 'POST'])
 def configure_app():
