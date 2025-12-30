@@ -99,23 +99,29 @@ def login():
 # Route to handle the redirect URI after authorization
 @app.route('/redirect')
 def redirect_page():
-    session.clear()
     # Get the authorization code from the request parameters
     code = request.args.get('code')
     # Exchange the authorization code for an access token and refresh token
     spotify_oauth = create_spotify_oauth()
     token_info = spotify_oauth.get_access_token(code)
-    # Save the token info in the session
-    session[TOKEN_INFO] = token_info
-    # Save refresh token to DB and user id to session for persistence
+    
+    # Get the current user info BEFORE clearing session
     sp = spotipy.Spotify(auth=token_info['access_token'])
     try:
-        user_id = sp.current_user()['id']
-        session['user_id'] = user_id
-        if token_info.get('refresh_token'):
-            save_refresh_token(user_id, token_info.get('refresh_token'))
-    except Exception:
-        pass
+        user_info = sp.current_user()
+        user_id = user_info['id']
+    except Exception as e:
+        return redirect(url_for('start'))  # Redirect to start if auth fails
+    
+    # Now clear and set fresh session data for this specific user
+    session.clear()
+    session[TOKEN_INFO] = token_info
+    session['user_id'] = user_id
+    
+    # Save refresh token to DB for persistence across sessions
+    if token_info.get('refresh_token'):
+        save_refresh_token(user_id, token_info.get('refresh_token'))
+    
     # Redirect the user to the progress page which will start the background job
     return redirect(url_for('progress'))
 
@@ -130,8 +136,14 @@ def progress():
 def create_playlist_job(job_id, token_info, playlist_name, playlist_public):
     try:
         JOBS[job_id]['status'] = 'working'
+        # Create Spotify instance with the provided access token
         sp = spotipy.Spotify(auth=token_info['access_token'])
+        
+        # Get current user info to verify correct user
         user_id = sp.current_user()['id']
+        JOBS[job_id]['user_id'] = user_id  # Store for debugging
+        
+        # Create a new playlist for this specific user
         new_playlist = sp.user_playlist_create(user_id, playlist_name, playlist_public)
         new_playlist_id = new_playlist['id']
         new_playlist_url = new_playlist.get('external_urls', {}).get('spotify')
@@ -139,10 +151,12 @@ def create_playlist_job(job_id, token_info, playlist_name, playlist_public):
         JOBS[job_id]['total'] = 0
         JOBS[job_id]['progress'] = 0
 
+        # Fetch THIS USER'S liked songs (not anyone else's)
         seen = set()
         offset = 0
         limit = 50
         while True:
+            # This fetches the CURRENT user's saved tracks based on their access token
             saved = sp.current_user_saved_tracks(limit=limit, offset=offset)
             items = saved.get('items', [])
             if not items:
@@ -160,7 +174,8 @@ def create_playlist_job(job_id, token_info, playlist_name, playlist_public):
                     sp.user_playlist_add_tracks(user_id, new_playlist_id, chunk)
                     JOBS[job_id]['progress'] += len(chunk)
             offset += limit
-
+        
+        JOBS[job_id]['total'] = JOBS[job_id]['progress']
         JOBS[job_id]['status'] = 'done'
         JOBS[job_id]['playlist_url'] = new_playlist_url
         JOBS[job_id]['playlist_name'] = playlist_name
@@ -235,28 +250,42 @@ def job_status():
     return jsonify(JOBS[job_id])
 
 def get_token():
+    """Get the current user's valid access token from session"""
     token_info = session.get(TOKEN_INFO, None)
+    
     if not token_info:
-        # Try to recover using stored refresh token for this user
+        # Token not in session, try to recover using stored refresh token
         user_id = session.get('user_id')
         if user_id:
             refresh_token = get_refresh_token(user_id)
             if refresh_token:
                 spotify_oauth = create_spotify_oauth()
-                token_info = spotify_oauth.refresh_access_token(refresh_token)
-                session[TOKEN_INFO] = token_info
-                return token_info
-        raise Exception('User not logged in')
+                try:
+                    token_info = spotify_oauth.refresh_access_token(refresh_token)
+                    session[TOKEN_INFO] = token_info
+                    return token_info
+                except Exception as e:
+                    raise Exception(f'Failed to refresh token: {str(e)}')
+        raise Exception('User not logged in - no token in session')
+    
     # Check if the token is expired and refresh it if necessary
     now = int(time.time())
     is_expired = token_info.get('expires_at', 0) - now < 60
+    
     if is_expired:
+        # Token expired, refresh it
         spotify_oauth = create_spotify_oauth()
-        token_info = spotify_oauth.refresh_access_token(token_info['refresh_token'])
-        session[TOKEN_INFO] = token_info
-        # persist refreshed refresh_token if returned
-        if 'refresh_token' in token_info and session.get('user_id'):
-            save_refresh_token(session.get('user_id'), token_info['refresh_token'])
+        try:
+            token_info = spotify_oauth.refresh_access_token(token_info.get('refresh_token'))
+            session[TOKEN_INFO] = token_info
+            
+            # Persist refreshed refresh_token if returned
+            user_id = session.get('user_id')
+            if 'refresh_token' in token_info and user_id:
+                save_refresh_token(user_id, token_info['refresh_token'])
+        except Exception as e:
+            raise Exception(f'Failed to refresh expired token: {str(e)}')
+    
     return token_info
 
 def create_spotify_oauth(client_id=None, client_secret=None):
