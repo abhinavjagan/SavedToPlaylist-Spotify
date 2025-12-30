@@ -81,6 +81,11 @@
         <input type="text" id="client_secret" name="client_secret">
         <input type="submit" value="Submit">
     </form>
-    <div class="success-message">Saved songs added successfully</div>
+    <div class="success-message">
+        Saved songs added successfully
+        {% if playlist_name and playlist_url %}
+            <div style="margin-top:10px;font-size:18px;color:#fff;">Created playlist: <a href="{{ playlist_url }}" target="_blank" style="color:#1db954;">{{ playlist_name }}</a></div>
+        {% endif %}
+    </div>
 </body>
 </html>

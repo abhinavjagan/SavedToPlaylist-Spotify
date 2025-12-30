@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Saving...</title>
+    <style>
+        body { font-family: Arial, sans-serif; background:#000; color:#fff; }
+        .center { max-width:600px; margin:40px auto; text-align:center; }
+        .bar { width:100%; background:#222; border-radius:8px; overflow:hidden; height:20px; margin-top:20px }
+        .fill { height:100%; width:0%; background:#1db954; transition:width 0.3s }
+        .spinner { margin-top:20px }
+    </style>
+</head>
+<body>
+    <div class="center">
+        <h1>Creating playlist: {{ playlist_name }}</h1>
+        <p id="status">Starting...</p>
+        <div class="bar"><div id="fill" class="fill"></div></div>
+        <div id="link" style="margin-top:20px"></div>
+        <div class="spinner" id="spinner">⏳ Working...</div>
+    </div>
+
+    <script>
+    // Start the job and poll status until done
+    async function startJob(){
+        const resp = await fetch('/start_save', { method: 'POST' });
+        if(!resp.ok){ document.getElementById('status').innerText = 'Not logged in or error starting job.'; return; }
+        const data = await resp.json();
+        const jobId = data.job_id;
+        poll(jobId);
+    }
+
+    async function poll(jobId){
+        const url = '/job_status?job_id=' + encodeURIComponent(jobId);
+        const resp = await fetch(url);
+        if(!resp.ok){ document.getElementById('status').innerText = 'Error checking job status.'; return; }
+        const data = await resp.json();
+        const status = data.status;
+        document.getElementById('status').innerText = status;
+        if(data.progress !== undefined && data.progress !== null){
+            // We don't know total, so show an animated fill based on progress mod
+            const p = Math.min(100, (data.progress % 200));
+            document.getElementById('fill').style.width = Math.min(100, p) + '%';
+        }
+        if(status === 'done'){
+            document.getElementById('spinner').innerText = '✅ Done';
+            if(data.playlist_url){
+                document.getElementById('link').innerHTML = 'Playlist created: <a href="'+data.playlist_url+'" target="_blank" style="color:#1db954">'+(data.playlist_name || 'Open')+'</a>';
+            }
+            return;
+        }
+        if(status === 'error'){
+            document.getElementById('spinner').innerText = '❌ Error';
+            document.getElementById('status').innerText = data.message || 'Error';
+            return;
+        }
+        setTimeout(()=>poll(jobId), 1500);
+    }
+
+    // Kick off when the page loads
+    window.addEventListener('load', startJob);
+    </script>
+</body>
+</html>
