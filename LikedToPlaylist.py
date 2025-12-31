@@ -497,38 +497,45 @@ def recommendations_page():
 
 @app.route('/api/analyze-taste', methods=['POST'])
 def analyze_taste():
-    """Analyze user's music taste from playlists and liked songs"""
+    """Analyze user's music taste - OPTIMIZED to prevent worker timeouts
+    
+    CRITICAL: Worker timeout is 45 seconds. This endpoint MUST complete in < 25 seconds.
+    All settings are ULTRA-CONSERVATIVE to ensure completion.
+    """
     try:
         token_info = get_token()
         if not token_info:
             return jsonify({'error': 'Not authenticated'}), 401
         
-        sp = create_spotify_client(token_info['access_token'], timeout=5)
+        # Use 2-second timeout per request (critical for preventing hangs)
+        sp = create_spotify_client(token_info['access_token'], timeout=2)
         
         # Get parameters
         data = request.get_json() or {}
-        include_playlists = data.get('include_playlists', True)
+        # PLAYLISTS DISABLED BY DEFAULT (major timeout source)
+        include_playlists = data.get('include_playlists', False)
         
-        logger.info("Starting taste analysis...")
+        logger.info("=== ANALYSIS START === playlists=%s", include_playlists)
         start_time = time.time()
         
-        # Analyze taste with VERY conservative limits to prevent timeout
-        # Worker timeout is 45s, so we need to finish well before that
-        # Using request timeout of 5 seconds for each Spotify API call
-        analyzer = MusicTasteAnalyzer(sp, request_timeout=5)
+        # Initialize analyzer with 2-second request timeout
+        analyzer = MusicTasteAnalyzer(sp, request_timeout=2)
         
         try:
-            # Reduced limits: 1 playlist max, 10 tracks per playlist, 30 liked songs max
+            # ULTRA-CONSERVATIVE LIMITS (to prevent worker timeout):
+            # - 15 liked songs (single API call, ~2 seconds)
+            # - NO playlists by default
+            # - 20 second max (25 second buffer before 45s worker timeout)
             analysis = analyzer.analyze_taste(
                 include_playlists=include_playlists,
-                playlist_limit=1,  # Only 1 playlist to minimize API calls
-                tracks_per_playlist=10,  # Only 10 tracks per playlist
-                liked_songs_limit=30,  # Only 30 liked songs max
-                max_analysis_time=35  # Global timeout of 35 seconds (10s buffer before worker timeout)
+                playlist_limit=0 if not include_playlists else 1,  # Max 1 playlist if requested
+                tracks_per_playlist=3,  # Only 3 tracks if playlists enabled
+                liked_songs_limit=15,  # Only 15 liked songs (fast, single call)
+                max_analysis_time=20  # HARD LIMIT: 20 seconds (25s buffer before timeout)
             )
         except TimeoutException as e:
-            logger.error("Analysis operation timed out: %s", e)
-            return jsonify({'error': 'Analysis took too long. Try unchecking "Include playlists".'}), 408
+            logger.error("=== TIMEOUT === %s", e)
+            return jsonify({'error': 'Analysis timeout. Please try again without playlists.'}), 408
         
         elapsed_time = time.time() - start_time
         logger.info("Taste analysis completed in %.2f seconds", elapsed_time)
@@ -594,19 +601,20 @@ def generate_recommendations():
         analysis = get_analysis_from_cache(cache_key) if cache_key else {}
         
         if not analysis or analysis.get('error'):
-            logger.info("No cached analysis found, running new analysis")
-            analyzer = MusicTasteAnalyzer(sp, request_timeout=5)
+            logger.info("No cached analysis found, running FAST analysis for recommendations")
+            analyzer = MusicTasteAnalyzer(sp, request_timeout=2)
             try:
+                # MINIMAL analysis: 15 liked songs only, no playlists
                 analysis = analyzer.analyze_taste(
-                    include_playlists=True,
-                    playlist_limit=1,
-                    tracks_per_playlist=10,
-                    liked_songs_limit=30,
-                    max_analysis_time=30  # 30 second timeout for recommendation generation
+                    include_playlists=False,  # NEVER use playlists here
+                    playlist_limit=0,
+                    tracks_per_playlist=0,
+                    liked_songs_limit=15,  # Only 15 liked songs (fast)
+                    max_analysis_time=15  # 15 second hard limit
                 )
             except TimeoutException as e:
-                logger.error("Analysis timed out during recommendation generation: %s", e)
-                return jsonify({'error': 'Analysis took too long. Please try again.'}), 408
+                logger.error("=== TIMEOUT === During recommendation analysis: %s", e)
+                return jsonify({'error': 'Analysis timeout. Please try the analyze button first.'}), 408
             # Save new analysis to cache
             cache_key = save_analysis_to_cache(user_id, analysis)
             if cache_key:
