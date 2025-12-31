@@ -253,7 +253,7 @@ class RecommendationEngine:
     
     def generate_recommendations(self, 
                                 analysis: Dict[str, Any],
-                                limit: int = 50,
+                                limit: int = 20,
                                 include_audio_targets: bool = True) -> List[Dict[str, Any]]:
         """Generate track recommendations based on taste analysis"""
         
@@ -263,12 +263,19 @@ class RecommendationEngine:
         recommendations = []
         available_genres = self.get_available_genres()
         
-        # Prepare seeds
+        # Prepare seeds - max 5 total (Spotify API constraint)
         seed_artists = analysis.get('top_artist_ids', [])[:2]
         seed_genres = [
-            genre for genre in analysis.get('genre_seeds', [])[:3]
+            genre for genre in analysis.get('genre_seeds', [])[:5]
             if genre in available_genres
         ]
+        
+        # Ensure total seeds don't exceed 5 (Spotify API limit)
+        total_seeds = len(seed_artists) + len(seed_genres)
+        if total_seeds > 5:
+            # Prioritize artists, then trim genres
+            max_genres = 5 - len(seed_artists)
+            seed_genres = seed_genres[:max_genres]
         
         # Ensure we have at least one seed
         if not seed_artists and not seed_genres:

@@ -471,7 +471,7 @@ def generate_recommendations():
         # Get parameters
         data = request.get_json() or {}
         playlist_name = data.get('playlist_name', 'My Recommendations')
-        track_limit = min(int(data.get('track_limit', 30)), 50)
+        track_limit = min(int(data.get('track_limit', 20)), 100)  # Default 20, max 100
         use_audio_features = data.get('use_audio_features', True)
         public = data.get('public', True)
         
