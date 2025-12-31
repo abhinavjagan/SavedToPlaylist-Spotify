@@ -169,15 +169,15 @@ class MusicTasteAnalyzer:
         return avg_features
     
     def analyze_taste(self, include_playlists: bool = True, 
-                     playlist_limit: int = 10,
-                     tracks_per_playlist: int = 50) -> Dict[str, Any]:
+                     playlist_limit: int = 3,
+                     tracks_per_playlist: int = 30) -> Dict[str, Any]:
         """Comprehensive analysis of user's music taste"""
         
         all_tracks = []
         
-        # Get liked songs
+        # Get liked songs (reduced for faster processing)
         logger.info("Fetching liked songs...")
-        liked_tracks = self.get_liked_songs(limit=500)
+        liked_tracks = self.get_liked_songs(limit=100)
         all_tracks.extend(liked_tracks)
         
         # Get playlist tracks
@@ -204,12 +204,21 @@ class MusicTasteAnalyzer:
         
         logger.info(f"Analyzing {len(all_tracks)} unique tracks...")
         
-        # Extract artist IDs
-        artist_ids = self.extract_artist_ids(all_tracks)
+        # Extract artist IDs and count frequency
+        artist_counter = Counter()
+        for track in all_tracks:
+            if track.get('artists'):
+                for artist in track['artists']:
+                    if artist.get('id'):
+                        artist_counter[artist['id']] += 1
         
-        # Get genre distribution
-        logger.info("Analyzing genres...")
-        genres = self.get_artist_genres(artist_ids)
+        # Only analyze top 100 artists for genres (optimization)
+        top_artist_ids_for_genres = [artist_id for artist_id, _ in artist_counter.most_common(100)]
+        artist_ids = list(artist_counter.keys())
+        
+        # Get genre distribution from top artists only
+        logger.info(f"Analyzing genres from top {len(top_artist_ids_for_genres)} artists...")
+        genres = self.get_artist_genres(top_artist_ids_for_genres)
         top_genres = sorted(genres.items(), key=lambda x: x[1], reverse=True)[:10]
         
         # Get audio features
@@ -217,14 +226,7 @@ class MusicTasteAnalyzer:
         track_ids = [track['id'] for track in all_tracks if track.get('id')]
         avg_features = self.get_track_audio_features(track_ids)
         
-        # Get top artists
-        artist_counter = Counter()
-        for track in all_tracks:
-            if track.get('artists'):
-                for artist in track['artists']:
-                    if artist.get('id') and artist.get('name'):
-                        artist_counter[artist['id']] = artist_counter.get(artist['id'], 0) + 1
-        
+        # Get top artists (already counted above)
         top_artist_ids = [artist_id for artist_id, _ in artist_counter.most_common(10)]
         
         return {
