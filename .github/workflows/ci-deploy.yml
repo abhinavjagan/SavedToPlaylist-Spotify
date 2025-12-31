@@ -7,6 +7,9 @@ on:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    env:
+      RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+      RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,17 +24,17 @@ jobs:
 
       - name: Run quick smoke check
         run: python -m py_compile LikedToPlaylist.py || true
-      
+
       - name: Install jq
-        if: ${{ secrets.RENDER_API_KEY != '' && secrets.RENDER_SERVICE_ID != '' }}
+        if: ${{ env.RENDER_API_KEY != '' && env.RENDER_SERVICE_ID != '' }}
         run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Trigger Render deploy (optional)
-        if: ${{ secrets.RENDER_API_KEY != '' && secrets.RENDER_SERVICE_ID != '' }}
+        if: ${{ env.RENDER_API_KEY != '' && env.RENDER_SERVICE_ID != '' }}
         run: |
-          echo "Triggering Render deploy for service ${{ secrets.RENDER_SERVICE_ID }}"
-          curl -s -X POST "https://api.render.com/deploy/svcs/${{ secrets.RENDER_SERVICE_ID }}/deploys" \
-            -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
+          echo "Triggering Render deploy for service ${RENDER_SERVICE_ID}"
+          curl -s -X POST "https://api.render.com/deploy/svcs/${RENDER_SERVICE_ID}/deploys" \
+            -H "Authorization: Bearer ${RENDER_API_KEY}" \
             -H "Accept: application/json" \
             -H "Content-Type: application/json" \
             -d '{}' \
