@@ -13,6 +13,7 @@ from spotipy.exceptions import SpotifyException, SpotifyOauthError
 from urllib.parse import urljoin
 from flask import Flask, request, url_for, session, redirect, render_template, jsonify
 from dotenv import load_dotenv
+from recommendations import MusicTasteAnalyzer, RecommendationEngine
 
 load_dotenv()
 
@@ -412,6 +413,112 @@ def create_spotify_oauth(client_id=None, client_secret=None):
         scope='user-library-read playlist-modify-public playlist-modify-private',
         cache_handler=MemoryCacheHandler()
     )
+
+# ========== RECOMMENDATION SYSTEM ROUTES ==========
+
+@app.route('/recommendations')
+def recommendations_page():
+    """Display the recommendations dashboard"""
+    token_info = get_token()
+    if not token_info:
+        return redirect('/login')
+    return render_template('recommendations.html')
+
+@app.route('/api/analyze-taste', methods=['POST'])
+def analyze_taste():
+    """Analyze user's music taste from playlists and liked songs"""
+    try:
+        token_info = get_token()
+        if not token_info:
+            return jsonify({'error': 'Not authenticated'}), 401
+        
+        sp = spotipy.Spotify(auth=token_info['access_token'])
+        
+        # Get parameters
+        data = request.get_json() or {}
+        include_playlists = data.get('include_playlists', True)
+        
+        # Analyze taste
+        analyzer = MusicTasteAnalyzer(sp)
+        analysis = analyzer.analyze_taste(
+            include_playlists=include_playlists,
+            playlist_limit=10,
+            tracks_per_playlist=50
+        )
+        
+        # Store analysis in session for later use
+        session['taste_analysis'] = analysis
+        
+        return jsonify(analysis)
+        
+    except SpotifyException as e:
+        logger.error(f"Spotify API error during taste analysis: {e}")
+        return jsonify({'error': f'Spotify API error: {str(e)}'}), 500
+    except Exception as e:
+        logger.error(f"Error analyzing taste: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/generate-recommendations', methods=['POST'])
+def generate_recommendations():
+    """Generate recommendations and create playlist"""
+    try:
+        token_info = get_token()
+        if not token_info:
+            return jsonify({'error': 'Not authenticated'}), 401
+        
+        sp = spotipy.Spotify(auth=token_info['access_token'])
+        
+        # Get parameters
+        data = request.get_json() or {}
+        playlist_name = data.get('playlist_name', 'My Recommendations')
+        track_limit = min(int(data.get('track_limit', 30)), 50)
+        use_audio_features = data.get('use_audio_features', True)
+        public = data.get('public', True)
+        
+        # Get analysis from session or run new analysis
+        analysis = session.get('taste_analysis')
+        if not analysis:
+            analyzer = MusicTasteAnalyzer(sp)
+            analysis = analyzer.analyze_taste()
+            session['taste_analysis'] = analysis
+        
+        # Generate recommendations
+        engine = RecommendationEngine(sp)
+        recommendations = engine.generate_recommendations(
+            analysis=analysis,
+            limit=track_limit,
+            include_audio_targets=use_audio_features
+        )
+        
+        if not recommendations:
+            return jsonify({'error': 'No recommendations could be generated'}), 400
+        
+        # Get user ID
+        user_id = session.get('user_id')
+        if not user_id:
+            user_profile = sp.current_user()
+            user_id = user_profile['id']
+            session['user_id'] = user_id
+        
+        # Create playlist
+        result = engine.create_recommendation_playlist(
+            user_id=user_id,
+            recommendations=recommendations,
+            playlist_name=playlist_name,
+            public=public
+        )
+        
+        if result.get('error'):
+            return jsonify(result), 400
+        
+        return jsonify(result)
+        
+    except SpotifyException as e:
+        logger.error(f"Spotify API error during recommendation generation: {e}")
+        return jsonify({'error': f'Spotify API error: {str(e)}'}), 500
+    except Exception as e:
+        logger.error(f"Error generating recommendations: {e}")
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     debug_mode = os.getenv('FLASK_ENV') != 'production'

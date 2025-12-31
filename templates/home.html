@@ -189,6 +189,31 @@
             transform: translateY(-2px);
         }
         
+        .nav-links {
+            display: flex;
+            gap: 15px;
+            justify-content: center;
+            margin-bottom: 30px;
+        }
+        
+        .nav-link {
+            padding: 12px 25px;
+            background: rgba(29, 185, 84, 0.15);
+            border: 1px solid rgba(29, 185, 84, 0.4);
+            border-radius: 20px;
+            color: #1ed760;
+            text-decoration: none;
+            font-weight: 600;
+            transition: all 0.3s ease;
+            font-size: 16px;
+        }
+        
+        .nav-link:hover {
+            background: rgba(29, 185, 84, 0.3);
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(29, 185, 84, 0.3);
+        }
+        
         .footer {
             margin-top: 50px;
             font-size: 15px;
@@ -238,9 +263,15 @@
             <ul>
                 <li>🎧 Connect your Spotify in one click</li>
                 <li>📝 Auto-create playlists from liked songs</li>
+                <li>🤖 AI-powered music recommendations</li>
                 <li>👥 Share your music taste with anyone</li>
                 <li>🔐 Secure & verified with Spotify</li>
             </ul>
+        </div>
+        
+        <div class="nav-links">
+            <a href="/start" class="nav-link">💾 Save Liked Songs</a>
+            <a href="/recommendations" class="nav-link">🎯 Get Recommendations</a>
         </div>
         
         <a href="/start" class="cta-button">Let's Go! 🚀</a>
