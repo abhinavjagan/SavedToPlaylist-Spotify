@@ -5,22 +5,52 @@ Analyzes user's playlists and liked songs to generate personalized recommendatio
 import time
 import logging
 from collections import Counter
-from typing import List, Dict, Any, Set, Tuple
+from typing import List, Dict, Any, Optional
+import random
+import signal
+from contextlib import contextmanager
 import spotipy
 from spotipy.exceptions import SpotifyException
 
 logger = logging.getLogger(__name__)
 
 
+class TimeoutException(Exception):
+    """Exception raised when operation times out"""
+    pass
+
+
+@contextmanager
+def time_limit(seconds: int):
+    """Context manager to limit execution time of a block of code"""
+    def signal_handler(signum, frame):
+        raise TimeoutException(f"Operation timed out after {seconds} seconds")
+    
+    # Only use signal on Unix systems
+    if hasattr(signal, 'SIGALRM'):
+        signal.signal(signal.SIGALRM, signal_handler)
+        signal.alarm(seconds)
+        try:
+            yield
+        finally:
+            signal.alarm(0)
+    else:
+        # On Windows or systems without SIGALRM, just yield without timeout
+        yield
+
+
 class MusicTasteAnalyzer:
     """Analyzes user's music taste from playlists and liked songs"""
     
-    def __init__(self, sp: spotipy.Spotify, request_timeout: int = 10):
+    def __init__(self, sp: spotipy.Spotify, request_timeout: int = 8):
         self.sp = sp
         self.request_timeout = request_timeout
-        # Set timeout on the underlying session
+        # Set timeout on the Spotify client properly
         if hasattr(sp, '_session'):
             sp._session.timeout = request_timeout
+        # Also set it directly on the client if supported
+        if not hasattr(sp, 'requests_timeout') or sp.requests_timeout is None:
+            sp.requests_timeout = request_timeout
         
     def get_user_playlists(self, limit: int = 50) -> List[Dict[str, Any]]:
         """Fetch all user's playlists"""
@@ -47,12 +77,15 @@ class MusicTasteAnalyzer:
                     break
                         
                 except SpotifyException as e:
-                    logger.warning(f"Spotify error fetching playlists (attempt {retry + 1}/{max_retries}): {e}")
+                    logger.warning("Spotify error fetching playlists (attempt %d/%d): %s", retry + 1, max_retries, e)
                     if retry == max_retries - 1:
                         return playlists
-                    time.sleep(0.5)
+                    time.sleep(0.3)
+                except (ConnectionError, TimeoutError, OSError) as e:
+                    logger.error("Network/timeout error fetching playlists: %s", e)
+                    return playlists
                 except Exception as e:
-                    logger.error(f"Unexpected error fetching playlists: {e}")
+                    logger.error("Unexpected error fetching playlists: %s", e)
                     return playlists
             
             if not response.get('next'):
@@ -93,12 +126,15 @@ class MusicTasteAnalyzer:
                     break
                         
                 except SpotifyException as e:
-                    logger.warning(f"Error fetching playlist tracks (attempt {retry + 1}/{max_retries}): {e}")
+                    logger.warning("Error fetching playlist tracks (attempt %d/%d): %s", retry + 1, max_retries, e)
                     if retry == max_retries - 1:
                         return tracks
-                    time.sleep(0.5)
+                    time.sleep(0.3)
+                except (ConnectionError, TimeoutError, OSError) as e:
+                    logger.error("Network/timeout error fetching playlist tracks: %s", e)
+                    return tracks
                 except Exception as e:
-                    logger.error(f"Unexpected error fetching playlist tracks: {e}")
+                    logger.error("Unexpected error fetching playlist tracks: %s", e)
                     return tracks
                     
             if not response.get('next'):
@@ -106,13 +142,16 @@ class MusicTasteAnalyzer:
                 
         return tracks[:limit]
     
-    def get_liked_songs(self, limit: int = 500) -> List[Dict[str, Any]]:
-        """Fetch user's liked songs"""
+    def get_liked_songs(self, limit: int = 30) -> List[Dict[str, Any]]:
+        """Fetch user's liked songs (default limit reduced to 30 for performance)"""
         tracks = []
         offset = 0
         max_retries = 2
+        max_iterations = 2  # Prevent long-running loops
+        iteration = 0
         
-        while len(tracks) < limit:
+        while len(tracks) < limit and iteration < max_iterations:
+            iteration += 1
             for retry in range(max_retries):
                 try:
                     response = self.sp.current_user_saved_tracks(
@@ -132,13 +171,20 @@ class MusicTasteAnalyzer:
                     break
                         
                 except SpotifyException as e:
-                    logger.warning(f"Error fetching liked songs (attempt {retry + 1}/{max_retries}): {e}")
+                    logger.warning("Error fetching liked songs (attempt %d/%d): %s", retry + 1, max_retries, e)
                     if retry == max_retries - 1:
                         return tracks
-                    time.sleep(0.5)
-                except Exception as e:
-                    logger.error(f"Unexpected error fetching liked songs: {e}")
+                    time.sleep(0.3)
+                except (ConnectionError, TimeoutError, OSError) as e:
+                    logger.error("Network/timeout error fetching liked songs: %s", e)
                     return tracks
+                except Exception as e:
+                    logger.error("Unexpected error fetching liked songs: %s", e)
+                    return tracks
+            
+            # Check if there's more data
+            if not response.get('next'):
+                break
                     
         return tracks[:limit]
     
@@ -175,12 +221,15 @@ class MusicTasteAnalyzer:
                     break
                             
                 except SpotifyException as e:
-                    logger.warning(f"Error fetching artist genres batch {i//50 + 1} (attempt {retry + 1}/{max_retries}): {e}")
+                    logger.warning("Error fetching artist genres batch %d (attempt %d/%d): %s", i//50 + 1, retry + 1, max_retries, e)
                     if retry < max_retries - 1:
-                        time.sleep(0.5)
+                        time.sleep(0.3)
                     # Continue to next batch even if this one fails
+                except (ConnectionError, TimeoutError, OSError) as e:
+                    logger.error("Network/timeout error fetching artist genres: %s", e)
+                    break
                 except Exception as e:
-                    logger.error(f"Unexpected error fetching artist genres: {e}")
+                    logger.error("Unexpected error fetching artist genres: %s", e)
                     break
                     
         return dict(genre_counter)
@@ -217,11 +266,14 @@ class MusicTasteAnalyzer:
                     break
                                     
                 except SpotifyException as e:
-                    logger.warning(f"Error fetching audio features batch {i//100 + 1} (attempt {retry + 1}/{max_retries}): {e}")
+                    logger.warning("Error fetching audio features batch %d (attempt %d/%d): %s", i//100 + 1, retry + 1, max_retries, e)
                     if retry < max_retries - 1:
-                        time.sleep(0.5)
+                        time.sleep(0.3)
+                except (ConnectionError, TimeoutError, OSError) as e:
+                    logger.error("Network/timeout error fetching audio features: %s", e)
+                    break
                 except Exception as e:
-                    logger.error(f"Unexpected error fetching audio features: {e}")
+                    logger.error("Unexpected error fetching audio features: %s", e)
                     break
         
         # Calculate averages
@@ -233,43 +285,58 @@ class MusicTasteAnalyzer:
         return avg_features
     
     def analyze_taste(self, include_playlists: bool = True, 
-                     playlist_limit: int = 2,
-                     tracks_per_playlist: int = 15) -> Dict[str, Any]:
-        """Comprehensive analysis of user's music taste"""
+                     playlist_limit: int = 1,
+                     tracks_per_playlist: int = 10,
+                     liked_songs_limit: int = 30,
+                     max_analysis_time: int = 35) -> Dict[str, Any]:
+        """Comprehensive analysis of user's music taste with aggressive timeout protection"""
         
         all_tracks = []
         start_time = time.time()
         
         # Get liked songs (heavily reduced for faster processing)
-        logger.info("Fetching liked songs...")
-        liked_tracks = self.get_liked_songs(limit=30)  # Reduced from 50 to 30
+        logger.info("Fetching liked songs (limit=%d)...", liked_songs_limit)
+        liked_tracks = self.get_liked_songs(limit=liked_songs_limit)
         all_tracks.extend(liked_tracks)
-        logger.info(f"Fetched {len(liked_tracks)} liked songs in {time.time() - start_time:.2f}s")
+        elapsed = time.time() - start_time
+        logger.info("Fetched %d liked songs in %.2fs", len(liked_tracks), elapsed)
+        
+        # Check timeout after liked songs
+        if elapsed > max_analysis_time * 0.4:  # 40% of time budget
+            logger.warning("Liked songs fetch took %.2fs (%.1f%% of budget), skipping playlists", elapsed, (elapsed/max_analysis_time)*100)
+            include_playlists = False
         
         # Get playlist tracks
         if include_playlists:
             playlist_start = time.time()
-            logger.info("Fetching playlists...")
-            playlists = self.get_user_playlists(limit=playlist_limit)
-            logger.info(f"Fetched {len(playlists)} playlists in {time.time() - playlist_start:.2f}s")
+            logger.info("Fetching playlists (limit=%d)...", playlist_limit)
             
-            for idx, playlist in enumerate(playlists[:playlist_limit]):
-                # Check if we're approaching timeout (stop at 20 seconds to be safe)
-                if time.time() - start_time > 20:
-                    logger.warning(f"Approaching timeout, stopping playlist analysis at {idx}/{playlist_limit}")
-                    break
-                    
-                playlist_id = playlist.get('id')
-                if playlist_id:
-                    logger.info(f"Analyzing playlist {idx + 1}/{min(len(playlists), playlist_limit)}: {playlist.get('name')}")
-                    try:
-                        track_start = time.time()
-                        tracks = self.get_playlist_tracks(playlist_id, limit=tracks_per_playlist)
-                        all_tracks.extend(tracks)
-                        logger.info(f"Fetched {len(tracks)} tracks in {time.time() - track_start:.2f}s")
-                    except Exception as e:
-                        logger.error(f"Error processing playlist {playlist.get('name')}: {e}")
-                        continue
+            # Check timeout before fetching playlists
+            if time.time() - start_time > max_analysis_time * 0.5:  # 50% of time budget
+                logger.warning("Already used %.2fs, skipping playlist fetch", time.time() - start_time)
+            else:
+                playlists = self.get_user_playlists(limit=playlist_limit)
+                logger.info("Fetched %d playlists in %.2fs", len(playlists), time.time() - playlist_start)
+                
+                for idx, playlist in enumerate(playlists[:playlist_limit]):
+                    # Check timeout before each playlist
+                    elapsed = time.time() - start_time
+                    if elapsed > max_analysis_time * 0.6:  # 60% of time budget
+                        logger.warning("Timeout protection: %.2fs elapsed (%.1f%% of budget), stopping playlist analysis at %d/%d", 
+                                     elapsed, (elapsed/max_analysis_time)*100, idx, playlist_limit)
+                        break
+                        
+                    playlist_id = playlist.get('id')
+                    if playlist_id:
+                        logger.info("Analyzing playlist %d/%d: %s", idx + 1, min(len(playlists), playlist_limit), playlist.get('name'))
+                        try:
+                            track_start = time.time()
+                            tracks = self.get_playlist_tracks(playlist_id, limit=tracks_per_playlist)
+                            all_tracks.extend(tracks)
+                            logger.info("Fetched %d tracks in %.2fs", len(tracks), time.time() - track_start)
+                        except (SpotifyException, ConnectionError, TimeoutError, OSError) as e:
+                            logger.error("Error processing playlist %s: %s", playlist.get('name'), e)
+                            continue
         
         if not all_tracks:
             return {
@@ -281,7 +348,7 @@ class MusicTasteAnalyzer:
         unique_tracks = {track['id']: track for track in all_tracks if track.get('id')}
         all_tracks = list(unique_tracks.values())
         
-        logger.info(f"Analyzing {len(all_tracks)} unique tracks...")
+        logger.info("Analyzing %d unique tracks...", len(all_tracks))
         
         # Extract artist IDs and count frequency
         artist_counter = Counter()
@@ -296,42 +363,56 @@ class MusicTasteAnalyzer:
         artist_ids = list(artist_counter.keys())
         
         # Get genre distribution from top artists only
-        # Check timeout
-        if time.time() - start_time > 25:
-            logger.warning("Approaching timeout, skipping genre analysis")
+        # Check timeout (use 75% of budget)
+        elapsed = time.time() - start_time
+        if elapsed > max_analysis_time * 0.75:
+            logger.warning("Timeout protection: %.2fs elapsed (%.1f%% of budget), skipping genre analysis", 
+                         elapsed, (elapsed/max_analysis_time)*100)
             genres = {}
             top_genres = []
         else:
-            logger.info(f"Analyzing genres from top {len(top_artist_ids_for_genres)} artists...")
+            logger.info("Analyzing genres from top %d artists...", len(top_artist_ids_for_genres))
             genre_start = time.time()
-            genres = self.get_artist_genres(top_artist_ids_for_genres)
-            top_genres = sorted(genres.items(), key=lambda x: x[1], reverse=True)[:10]
-            logger.info(f"Analyzed genres in {time.time() - genre_start:.2f}s")
+            try:
+                genres = self.get_artist_genres(top_artist_ids_for_genres)
+                top_genres = sorted(genres.items(), key=lambda x: x[1], reverse=True)[:10]
+                logger.info("Analyzed genres in %.2fs", time.time() - genre_start)
+            except (SpotifyException, ConnectionError, TimeoutError, OSError) as e:
+                logger.error("Error analyzing genres: %s", e)
+                genres = {}
+                top_genres = []
         
         # Get audio features (sample if too many tracks)
-        # Check timeout before expensive operations
-        if time.time() - start_time > 25:
-            logger.warning("Approaching timeout, skipping audio feature analysis")
+        # Check timeout before expensive operations (use 85% of budget)
+        elapsed = time.time() - start_time
+        if elapsed > max_analysis_time * 0.85:
+            logger.warning("Timeout protection: %.2fs elapsed (%.1f%% of budget), skipping audio feature analysis", 
+                         elapsed, (elapsed/max_analysis_time)*100)
             avg_features = {}
         else:
             logger.info("Analyzing audio features...")
             track_ids = [track['id'] for track in all_tracks if track.get('id')]
             
-            # Limit audio feature analysis to 100 tracks max for performance (reduced from 200)
-            if len(track_ids) > 100:
-                import random
-                track_ids = random.sample(track_ids, 100)
-                logger.info(f"Sampled {len(track_ids)} tracks for audio feature analysis")
+            # Limit audio feature analysis to 50 tracks max for performance (reduced from 100)
+            if len(track_ids) > 50:
+                # Use seed for reproducibility in testing/debugging
+                random.seed(42)
+                track_ids = random.sample(track_ids, 50)
+                logger.info("Sampled %d tracks for audio feature analysis", len(track_ids))
             
             feature_start = time.time()
-            avg_features = self.get_track_audio_features(track_ids)
-            logger.info(f"Analyzed audio features in {time.time() - feature_start:.2f}s")
+            try:
+                avg_features = self.get_track_audio_features(track_ids)
+                logger.info("Analyzed audio features in %.2fs", time.time() - feature_start)
+            except (SpotifyException, ConnectionError, TimeoutError, OSError) as e:
+                logger.error("Error analyzing audio features: %s", e)
+                avg_features = {}
         
         # Get top artists (already counted above)
         top_artist_ids = [artist_id for artist_id, _ in artist_counter.most_common(10)]
         
         total_time = time.time() - start_time
-        logger.info(f"Total taste analysis completed in {total_time:.2f}s")
+        logger.info("Total taste analysis completed in %.2fs", total_time)
         
         return {
             'track_count': len(all_tracks),
@@ -351,12 +432,19 @@ class RecommendationEngine:
         self.sp = sp
         
     def get_available_genres(self) -> List[str]:
-        """Get list of available genre seeds"""
-        try:
-            return self.sp.recommendation_genre_seeds().get('genres', [])
-        except SpotifyException as e:
-            logger.error(f"Error fetching genre seeds: {e}")
-            return []
+        """Get list of available genre seeds with retry logic"""
+        max_retries = 3
+        for retry in range(max_retries):
+            try:
+                return self.sp.recommendation_genre_seeds().get('genres', [])
+            except SpotifyException as e:
+                logger.warning("Error fetching genre seeds (attempt %d/%d): %s", retry + 1, max_retries, e)
+                if retry < max_retries - 1:
+                    time.sleep(0.5 * (retry + 1))  # Exponential backoff
+        
+        # If all retries failed
+        logger.error("Failed to fetch genre seeds after %d attempts", max_retries)
+        return []
     
     def generate_recommendations(self, 
                                 analysis: Dict[str, Any],
@@ -371,22 +459,29 @@ class RecommendationEngine:
         available_genres = self.get_available_genres()
         
         # Prepare seeds - max 5 total (Spotify API constraint)
-        seed_artists = analysis.get('top_artist_ids', [])[:2]
-        seed_genres = [
-            genre for genre in analysis.get('genre_seeds', [])[:5]
+        seed_artists = analysis.get('top_artist_ids', [])[:2]  # Max 2 artists
+        
+        # Filter and limit genres
+        candidate_genres = [
+            genre for genre in analysis.get('genre_seeds', [])
             if genre in available_genres
         ]
         
-        # Ensure total seeds don't exceed 5 (Spotify API limit)
-        total_seeds = len(seed_artists) + len(seed_genres)
-        if total_seeds > 5:
-            # Prioritize artists, then trim genres
-            max_genres = 5 - len(seed_artists)
-            seed_genres = seed_genres[:max_genres]
+        # Calculate max genres we can use (total seeds must be ≤ 5)
+        max_genres = min(5 - len(seed_artists), len(candidate_genres))
+        seed_genres = candidate_genres[:max_genres]
         
         # Ensure we have at least one seed
         if not seed_artists and not seed_genres:
-            logger.warning("No valid seeds found for recommendations")
+            logger.error("No valid seeds found for recommendations. Artists: %d, Valid genres: %d/%d", 
+                        len(analysis.get('top_artist_ids', [])), 
+                        len(candidate_genres),
+                        len(analysis.get('genre_seeds', [])))
+            # Try fallback: use top tracks as seed if available
+            if analysis.get('track_count', 0) > 0:
+                logger.info("Attempting to use top tracks as fallback seed")
+                # This would require track IDs, which we don't have in the analysis
+                # For now, return empty with clear error
             return []
         
         # Prepare parameters
@@ -411,20 +506,23 @@ class RecommendationEngine:
         params = {k: v for k, v in params.items() if v is not None}
         
         try:
-            logger.info(f"Requesting recommendations with params: {params}")
+            logger.info("Requesting recommendations with params: %s", params)
             response = self.sp.recommendations(**params)
             recommendations = response.get('tracks', [])
+            logger.info("Received %d recommendations from Spotify", len(recommendations))
             
         except SpotifyException as e:
-            logger.error(f"Error getting recommendations: {e}")
+            logger.error("Error getting recommendations: %s", e)
+            if hasattr(e, 'http_status'):
+                logger.error("HTTP status code: %d", e.http_status)
             
         return recommendations
     
     def create_recommendation_playlist(self,
                                       user_id: str,
                                       recommendations: List[Dict[str, Any]],
-                                      playlist_name: str = None,
-                                      playlist_description: str = None,
+                                      playlist_name: Optional[str] = None,
+                                      playlist_description: Optional[str] = None,
                                       public: bool = True) -> Dict[str, Any]:
         """Create a playlist with recommended tracks"""
         
@@ -466,5 +564,10 @@ class RecommendationEngine:
             }
             
         except SpotifyException as e:
-            logger.error(f"Error creating recommendation playlist: {e}")
-            return {'error': str(e)}
+            logger.error("Error creating recommendation playlist: %s", e)
+            error_msg = str(e)
+            if hasattr(e, 'http_status'):
+                logger.error("HTTP status code: %d", e.http_status)
+                if e.http_status == 403:
+                    error_msg = "Permission denied. Ensure your app has playlist-modify permissions."
+            return {'error': error_msg}

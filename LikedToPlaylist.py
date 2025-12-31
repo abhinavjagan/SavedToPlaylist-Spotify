@@ -6,6 +6,9 @@ import threading
 import uuid
 import sqlite3
 import logging
+import json
+import tempfile
+from pathlib import Path
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from spotipy.cache_handler import MemoryCacheHandler
@@ -13,7 +16,7 @@ from spotipy.exceptions import SpotifyException, SpotifyOauthError
 from urllib.parse import urljoin
 from flask import Flask, request, url_for, session, redirect, render_template, jsonify
 from dotenv import load_dotenv
-from recommendations import MusicTasteAnalyzer, RecommendationEngine
+from recommendations import MusicTasteAnalyzer, RecommendationEngine, TimeoutException
 
 load_dotenv()
 
@@ -65,6 +68,56 @@ def get_refresh_token(user_id):
 
 init_db()
 
+# Cache directory for analysis data (avoid storing large data in session)
+CACHE_DIR = Path(tempfile.gettempdir()) / 'spotify_analysis_cache'
+CACHE_DIR.mkdir(exist_ok=True)
+
+def save_analysis_to_cache(user_id: str, analysis: dict) -> str:
+    """Save analysis data to cache and return cache key"""
+    cache_key = f"{user_id}_{int(time.time())}"
+    cache_file = CACHE_DIR / f"{cache_key}.json"
+    try:
+        with open(cache_file, 'w') as f:
+            json.dump(analysis, f)
+        # Clean up old cache files (older than 1 hour)
+        cleanup_old_cache()
+        return cache_key
+    except Exception as e:
+        logger.error('Failed to save analysis to cache: %s', e)
+        return ''
+
+def get_analysis_from_cache(cache_key: str) -> dict:
+    """Retrieve analysis data from cache"""
+    if not cache_key:
+        return {}
+    cache_file = CACHE_DIR / f"{cache_key}.json"
+    try:
+        if cache_file.exists():
+            with open(cache_file, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        logger.error('Failed to read analysis from cache: %s', e)
+    return {}
+
+def cleanup_old_cache(max_age_seconds: int = 3600) -> None:
+    """Remove cache files older than max_age_seconds"""
+    try:
+        current_time = time.time()
+        for cache_file in CACHE_DIR.glob('*.json'):
+            if current_time - cache_file.stat().st_mtime > max_age_seconds:
+                cache_file.unlink(missing_ok=True)
+    except Exception as e:
+        logger.error('Failed to cleanup cache: %s', e)
+
+
+def create_spotify_client(access_token: str, timeout: int = 8) -> spotipy.Spotify:
+    """Create a Spotify client with proper timeout configuration"""
+    sp = spotipy.Spotify(auth=access_token, requests_timeout=timeout)
+    # Additional timeout configuration for the session
+    if hasattr(sp, '_session'):
+        sp._session.timeout = timeout
+    return sp
+
 # Root route - show landing page
 @app.route('/')
 def index():
@@ -74,13 +127,9 @@ def index():
 @app.route('/config', methods=['GET', 'POST'])
 def configure_app():
     # Always create playlist from the user's Liked Songs; playlist name is auto-generated.
-    global CLIENT_ID, CLIENT_SECRET, NEED_CREDS
+    # Note: CLIENT_ID and CLIENT_SECRET should be set via environment variables
+    # This route is for user preferences only, not for setting credentials
     if request.method == 'POST':
-        # If server needs creds, accept them from the form (dev only)
-        if NEED_CREDS and request.form.get('client_id') and request.form.get('client_secret'):
-            CLIENT_ID = request.form.get('client_id')
-            CLIENT_SECRET = request.form.get('client_secret')
-            NEED_CREDS = False
         # Auto-generate playlist name using today's date to avoid duplicates
         from datetime import datetime
         session['playlist_name'] = f"Liked Songs - {datetime.now().strftime('%Y-%m-%d')}"
@@ -138,7 +187,14 @@ def redirect_page():
             title='Authorization Failed',
             message='Spotify rejected the authorization code. Please restart the sign-in flow and try again.'
         ), 400
-    except Exception as exc:
+    except (ConnectionError, TimeoutError):
+        logger.exception('Network error during Spotify authorization')
+        return render_template(
+            'error.html',
+            title='Authorization Failed',
+            message='Network error during authorization. Please check your connection and try again.'
+        ), 500
+    except Exception:
         logger.exception('Unexpected error exchanging Spotify authorization code')
         return render_template(
             'error.html',
@@ -147,7 +203,7 @@ def redirect_page():
         ), 500
 
     try:
-        sp = spotipy.Spotify(auth=token_info['access_token'])
+        sp = create_spotify_client(token_info['access_token'])
         user_info = sp.current_user()
         user_id = user_info['id']
     except SpotifyException as exc:
@@ -163,7 +219,14 @@ def redirect_page():
             title='Profile Lookup Failed',
             message=message
         ), 403
-    except Exception as exc:
+    except (ConnectionError, TimeoutError):
+        logger.exception('Network error fetching Spotify profile')
+        return render_template(
+            'error.html',
+            title='Profile Lookup Failed',
+            message='Network error reading your profile. Please check your connection and try again.'
+        ), 500
+    except Exception:
         logger.exception('Failed to fetch Spotify profile for authenticated user')
         return render_template(
             'error.html',
@@ -209,7 +272,7 @@ def create_playlist_job(job_id, expected_user_id, token_info, playlist_name, pla
         JOBS[job_id]['status'] = 'working'
         
         # Create Spotify instance with the user's access token (NOT app credentials)
-        sp = spotipy.Spotify(auth=token_info['access_token'])
+        sp = create_spotify_client(token_info['access_token'])
         
         # Verify we have the correct user's token
         current_user = sp.current_user()
@@ -217,10 +280,12 @@ def create_playlist_job(job_id, expected_user_id, token_info, playlist_name, pla
         
         # SECURITY CHECK: Ensure token matches expected user
         if actual_user_id != expected_user_id:
-            raise Exception(
+            error_msg = (
                 f'Token user mismatch! Expected {expected_user_id}, got {actual_user_id}. '
                 f'This is a security issue - playlist would be created in wrong account!'
             )
+            logger.error(error_msg)
+            raise ValueError(error_msg)
         
         JOBS[job_id]['user_id'] = actual_user_id
         
@@ -270,21 +335,27 @@ def create_playlist_job(job_id, expected_user_id, token_info, playlist_name, pla
                 'as a tester for the app in developer.spotify.com.'
             )
         JOBS[job_id]['message'] = message
-    except Exception as e:
+        logger.error('Spotify error creating playlist: %s', message)
+    except (ValueError, ConnectionError, TimeoutError) as e:
         JOBS[job_id]['status'] = 'error'
         JOBS[job_id]['message'] = str(e)
+        logger.error('Error creating playlist: %s', e)
+    except Exception:
+        JOBS[job_id]['status'] = 'error'
+        JOBS[job_id]['message'] = 'An unexpected error occurred. Please try again.'
+        logger.exception('Unexpected error in create_playlist_job')
 
 @app.route('/saveLiked')
 def save_liked():
     try: 
         token_info = get_token()
-    except:
+    except Exception:
         # If the token info is not found, redirect the user to the login route
-        print('User not logged in')
+        logger.warning('User not logged in or token invalid')
         return redirect("/")
 
     # Create a Spotipy instance with the access token
-    sp = spotipy.Spotify(auth=token_info['access_token'])
+    sp = create_spotify_client(token_info['access_token'])
     user_id = sp.current_user()['id']
     # Create playlist with chosen name and privacy
     playlist_name = session.get('playlist_name', 'cadence')
@@ -325,7 +396,7 @@ def start_save():
         
         if not user_id:
             # If user_id not in session, get it from the token
-            sp = spotipy.Spotify(auth=token_info['access_token'])
+            sp = create_spotify_client(token_info['access_token'])
             user_id = sp.current_user()['id']
             session['user_id'] = user_id
             
@@ -400,7 +471,7 @@ def get_token():
     
     return token_info
 
-def create_spotify_oauth(client_id=None, client_secret=None):
+def create_spotify_oauth():
     # Use an in-memory cache so tokens do not leak across different user sessions
     redirect_uri = url_for('redirect_page', _external=True)
     if PUBLIC_URL:
@@ -432,7 +503,7 @@ def analyze_taste():
         if not token_info:
             return jsonify({'error': 'Not authenticated'}), 401
         
-        sp = spotipy.Spotify(auth=token_info['access_token'])
+        sp = create_spotify_client(token_info['access_token'], timeout=5)
         
         # Get parameters
         data = request.get_json() or {}
@@ -441,29 +512,59 @@ def analyze_taste():
         logger.info("Starting taste analysis...")
         start_time = time.time()
         
-        # Analyze taste with very conservative limits to prevent timeout
-        # Using request timeout of 10 seconds for each Spotify API call
-        analyzer = MusicTasteAnalyzer(sp, request_timeout=10)
-        analysis = analyzer.analyze_taste(
-            include_playlists=include_playlists,
-            playlist_limit=2,  # Reduced from 5 to 2
-            tracks_per_playlist=15  # Reduced from 20 to 15
-        )
+        # Analyze taste with VERY conservative limits to prevent timeout
+        # Worker timeout is 45s, so we need to finish well before that
+        # Using request timeout of 5 seconds for each Spotify API call
+        analyzer = MusicTasteAnalyzer(sp, request_timeout=5)
+        
+        try:
+            # Reduced limits: 1 playlist max, 10 tracks per playlist, 30 liked songs max
+            analysis = analyzer.analyze_taste(
+                include_playlists=include_playlists,
+                playlist_limit=1,  # Only 1 playlist to minimize API calls
+                tracks_per_playlist=10,  # Only 10 tracks per playlist
+                liked_songs_limit=30,  # Only 30 liked songs max
+                max_analysis_time=35  # Global timeout of 35 seconds (10s buffer before worker timeout)
+            )
+        except TimeoutException as e:
+            logger.error("Analysis operation timed out: %s", e)
+            return jsonify({'error': 'Analysis took too long. Try unchecking "Include playlists".'}), 408
         
         elapsed_time = time.time() - start_time
-        logger.info(f"Taste analysis completed in {elapsed_time:.2f} seconds")
+        logger.info("Taste analysis completed in %.2f seconds", elapsed_time)
         
-        # Store analysis in session for later use
-        session['taste_analysis'] = analysis
+        # Check if we got any error in the analysis
+        if analysis.get('error'):
+            return jsonify(analysis), 400
+        
+        # Store analysis in cache instead of session to avoid size limits
+        user_id = session.get('user_id')
+        if not user_id:
+            user_profile = sp.current_user()
+            user_id = user_profile['id']
+            session['user_id'] = user_id
+        
+        cache_key = save_analysis_to_cache(user_id, analysis)
+        if cache_key:
+            session['analysis_cache_key'] = cache_key
         
         return jsonify(analysis)
         
     except SpotifyException as e:
-        logger.error(f"Spotify API error during taste analysis: {e}")
-        return jsonify({'error': f'Spotify API error: {str(e)}'}), 500
+        logger.error("Spotify API error during taste analysis: %s", e)
+        error_message = 'Spotify API error occurred'
+        if hasattr(e, 'http_status'):
+            if e.http_status == 429:
+                error_message = 'Rate limit exceeded. Please wait a moment and try again.'
+            elif e.http_status == 403:
+                error_message = 'Permission denied. Please ensure the app has the required permissions.'
+        return jsonify({'error': error_message, 'details': str(e)}), 500
+    except (ConnectionError, TimeoutError, OSError) as e:
+        logger.error("Network/timeout error during taste analysis: %s", e)
+        return jsonify({'error': 'Network error or timeout. Please check your connection and try again.'}), 500
     except Exception as e:
-        logger.error(f"Error analyzing taste: {e}", exc_info=True)
-        return jsonify({'error': 'An unexpected error occurred during analysis. Please try again.'}), 500
+        logger.exception('Unexpected error analyzing taste')
+        return jsonify({'error': 'An unexpected error occurred during analysis. Please try again.', 'details': str(e) if app.debug else None}), 500
 
 @app.route('/api/generate-recommendations', methods=['POST'])
 def generate_recommendations():
@@ -473,7 +574,7 @@ def generate_recommendations():
         if not token_info:
             return jsonify({'error': 'Not authenticated'}), 401
         
-        sp = spotipy.Spotify(auth=token_info['access_token'])
+        sp = create_spotify_client(token_info['access_token'])
         
         # Get parameters
         data = request.get_json() or {}
@@ -482,12 +583,34 @@ def generate_recommendations():
         use_audio_features = data.get('use_audio_features', True)
         public = data.get('public', True)
         
-        # Get analysis from session or run new analysis
-        analysis = session.get('taste_analysis')
-        if not analysis:
-            analyzer = MusicTasteAnalyzer(sp)
-            analysis = analyzer.analyze_taste()
-            session['taste_analysis'] = analysis
+        # Get analysis from cache or run new analysis
+        user_id = session.get('user_id')
+        if not user_id:
+            user_profile = sp.current_user()
+            user_id = user_profile['id']
+            session['user_id'] = user_id
+        
+        cache_key = session.get('analysis_cache_key')
+        analysis = get_analysis_from_cache(cache_key) if cache_key else {}
+        
+        if not analysis or analysis.get('error'):
+            logger.info("No cached analysis found, running new analysis")
+            analyzer = MusicTasteAnalyzer(sp, request_timeout=5)
+            try:
+                analysis = analyzer.analyze_taste(
+                    include_playlists=True,
+                    playlist_limit=1,
+                    tracks_per_playlist=10,
+                    liked_songs_limit=30,
+                    max_analysis_time=30  # 30 second timeout for recommendation generation
+                )
+            except TimeoutException as e:
+                logger.error("Analysis timed out during recommendation generation: %s", e)
+                return jsonify({'error': 'Analysis took too long. Please try again.'}), 408
+            # Save new analysis to cache
+            cache_key = save_analysis_to_cache(user_id, analysis)
+            if cache_key:
+                session['analysis_cache_key'] = cache_key
         
         # Generate recommendations
         engine = RecommendationEngine(sp)
@@ -499,13 +622,6 @@ def generate_recommendations():
         
         if not recommendations:
             return jsonify({'error': 'No recommendations could be generated'}), 400
-        
-        # Get user ID
-        user_id = session.get('user_id')
-        if not user_id:
-            user_profile = sp.current_user()
-            user_id = user_profile['id']
-            session['user_id'] = user_id
         
         # Create playlist
         result = engine.create_recommendation_playlist(
@@ -521,11 +637,20 @@ def generate_recommendations():
         return jsonify(result)
         
     except SpotifyException as e:
-        logger.error(f"Spotify API error during recommendation generation: {e}")
-        return jsonify({'error': f'Spotify API error: {str(e)}'}), 500
+        logger.error("Spotify API error during recommendation generation: %s", e)
+        error_message = 'Spotify API error occurred'
+        if hasattr(e, 'http_status'):
+            if e.http_status == 429:
+                error_message = 'Rate limit exceeded. Please wait a moment and try again.'
+            elif e.http_status == 403:
+                error_message = 'Permission denied. Please ensure the app has the required permissions.'
+        return jsonify({'error': error_message, 'details': str(e)}), 500
+    except (ConnectionError, TimeoutError) as e:
+        logger.error("Network error during recommendation generation: %s", e)
+        return jsonify({'error': 'Network error. Please check your connection and try again.'}), 500
     except Exception as e:
-        logger.error(f"Error generating recommendations: {e}")
-        return jsonify({'error': str(e)}), 500
+        logger.exception('Unexpected error generating recommendations')
+        return jsonify({'error': 'An unexpected error occurred. Please try again.', 'details': str(e) if app.debug else None}), 500
 
 if __name__ == '__main__':
     debug_mode = os.getenv('FLASK_ENV') != 'production'
