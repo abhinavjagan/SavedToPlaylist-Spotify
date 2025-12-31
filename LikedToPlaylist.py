@@ -438,13 +438,20 @@ def analyze_taste():
         data = request.get_json() or {}
         include_playlists = data.get('include_playlists', True)
         
-        # Analyze taste
-        analyzer = MusicTasteAnalyzer(sp)
+        logger.info("Starting taste analysis...")
+        start_time = time.time()
+        
+        # Analyze taste with very conservative limits to prevent timeout
+        # Using request timeout of 10 seconds for each Spotify API call
+        analyzer = MusicTasteAnalyzer(sp, request_timeout=10)
         analysis = analyzer.analyze_taste(
             include_playlists=include_playlists,
-            playlist_limit=10,
-            tracks_per_playlist=50
+            playlist_limit=2,  # Reduced from 5 to 2
+            tracks_per_playlist=15  # Reduced from 20 to 15
         )
+        
+        elapsed_time = time.time() - start_time
+        logger.info(f"Taste analysis completed in {elapsed_time:.2f} seconds")
         
         # Store analysis in session for later use
         session['taste_analysis'] = analysis
@@ -455,8 +462,8 @@ def analyze_taste():
         logger.error(f"Spotify API error during taste analysis: {e}")
         return jsonify({'error': f'Spotify API error: {str(e)}'}), 500
     except Exception as e:
-        logger.error(f"Error analyzing taste: {e}")
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Error analyzing taste: {e}", exc_info=True)
+        return jsonify({'error': 'An unexpected error occurred during analysis. Please try again.'}), 500
 
 @app.route('/api/generate-recommendations', methods=['POST'])
 def generate_recommendations():
