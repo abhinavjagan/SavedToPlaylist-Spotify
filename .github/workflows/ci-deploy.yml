@@ -21,6 +21,10 @@ jobs:
 
       - name: Run quick smoke check
         run: python -m py_compile LikedToPlaylist.py || true
+      
+      - name: Install jq
+        if: ${{ secrets.RENDER_API_KEY != '' && secrets.RENDER_SERVICE_ID != '' }}
+        run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Trigger Render deploy (optional)
         if: ${{ secrets.RENDER_API_KEY != '' && secrets.RENDER_SERVICE_ID != '' }}
