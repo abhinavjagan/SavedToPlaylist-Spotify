@@ -8,6 +8,7 @@ import sqlite3
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from spotipy.cache_handler import MemoryCacheHandler
+from urllib.parse import urljoin
 from flask import Flask, request, url_for, session, redirect, render_template, jsonify
 from dotenv import load_dotenv
 
@@ -27,6 +28,9 @@ app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.secret_key = os.getenv('SECRET_KEY') or os.urandom(24)
 TOKEN_INFO = 'token_info'
 NEED_CREDS = False
+PUBLIC_URL = os.getenv('PUBLIC_URL')
+if PUBLIC_URL and PUBLIC_URL.startswith('https://'):
+    app.config['PREFERRED_URL_SCHEME'] = 'https'
 
 # In-memory job store for development. Replace with a DB or cache for production.
 JOBS = {}
@@ -335,10 +339,14 @@ def get_token():
 
 def create_spotify_oauth(client_id=None, client_secret=None):
     # Use an in-memory cache so tokens do not leak across different user sessions
+    redirect_uri = url_for('redirect_page', _external=True)
+    if PUBLIC_URL:
+        # Build redirect using the public base URL to avoid proxy scheme mismatches
+        redirect_uri = urljoin(PUBLIC_URL.rstrip('/') + '/', url_for('redirect_page', _external=False).lstrip('/'))
     return SpotifyOAuth(
         client_id=CLIENT_ID,
         client_secret=CLIENT_SECRET,
-        redirect_uri=url_for('redirect_page', _external=True),
+        redirect_uri=redirect_uri,
         scope='user-library-read playlist-modify-public playlist-modify-private',
         cache_handler=MemoryCacheHandler()
     )
