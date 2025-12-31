@@ -73,30 +73,22 @@ CACHE_DIR = Path(tempfile.gettempdir()) / 'spotify_analysis_cache'
 CACHE_DIR.mkdir(exist_ok=True)
 
 def save_analysis_to_cache(user_id: str, analysis: dict) -> str:
-    """Save analysis data to cache and return cache key"""
-    cache_key = f"{user_id}_{int(time.time())}"
-    cache_file = CACHE_DIR / f"{cache_key}.json"
-    try:
-        with open(cache_file, 'w') as f:
-            json.dump(analysis, f)
-        # Clean up old cache files (older than 1 hour)
-        cleanup_old_cache()
-        return cache_key
-    except Exception as e:
-        logger.error('Failed to save analysis to cache: %s', e)
-        return ''
+    """Save analysis data to cache and return cache key
+    
+    NOTE: Cache is disabled for fresh data on every request.
+    This function is kept for compatibility but does not cache.
+    """
+    # Cache disabled - always return empty string to force fresh analysis
+    logger.info("Cache disabled - will perform fresh analysis")
+    return ''
 
 def get_analysis_from_cache(cache_key: str) -> dict:
-    """Retrieve analysis data from cache"""
-    if not cache_key:
-        return {}
-    cache_file = CACHE_DIR / f"{cache_key}.json"
-    try:
-        if cache_file.exists():
-            with open(cache_file, 'r') as f:
-                return json.load(f)
-    except Exception as e:
-        logger.error('Failed to read analysis from cache: %s', e)
+    """Retrieve analysis data from cache
+    
+    NOTE: Cache is disabled - always returns empty dict to force fresh analysis.
+    """
+    # Cache disabled - always return empty to force fresh data
+    logger.info("Cache disabled - returning empty, will trigger fresh analysis")
     return {}
 
 def cleanup_old_cache(max_age_seconds: int = 3600) -> None:
@@ -104,8 +96,9 @@ def cleanup_old_cache(max_age_seconds: int = 3600) -> None:
     try:
         current_time = time.time()
         for cache_file in CACHE_DIR.glob('*.json'):
-            if current_time - cache_file.stat().st_mtime > max_age_seconds:
-                cache_file.unlink(missing_ok=True)
+            # Delete all cache files regardless of age
+            cache_file.unlink(missing_ok=True)
+            logger.info(f"Deleted cache file: {cache_file.name}")
     except Exception as e:
         logger.error('Failed to cleanup cache: %s', e)
 
@@ -122,6 +115,119 @@ def create_spotify_client(access_token: str, timeout: int = 8) -> spotipy.Spotif
 @app.route('/')
 def index():
     return render_template('home.html')
+
+# Debug route to check redirect URI configuration
+@app.route('/debug/cache')
+def debug_cache():
+    """Display MusicBrainz cache statistics"""
+    try:
+        from musicbrainz_integration import get_enricher
+        enricher = get_enricher()
+        cache = enricher.cache
+        
+        conn = sqlite3.connect(cache.db_path)
+        c = conn.cursor()
+        
+        # Total cached artists
+        c.execute('SELECT COUNT(*) FROM mb_artists')
+        total_artists = c.fetchone()[0]
+        
+        # Recent artists (last 7 days)
+        week_ago = int(time.time()) - 7*24*60*60
+        c.execute('SELECT COUNT(*) FROM mb_artists WHERE cached_at > ?', (week_ago,))
+        recent_artists = c.fetchone()[0]
+        
+        # Artists with genres
+        c.execute('SELECT COUNT(*) FROM mb_artists WHERE genres != ""')
+        artists_with_genres = c.fetchone()[0]
+        
+        # Artists with tags
+        c.execute('SELECT COUNT(*) FROM mb_artists WHERE tags != ""')
+        artists_with_tags = c.fetchone()[0]
+        
+        # Average rating
+        c.execute('SELECT AVG(rating) FROM mb_artists WHERE rating > 0')
+        avg_rating = c.fetchone()[0] or 0
+        
+        conn.close()
+        
+        import os
+        cache_size = os.path.getsize(cache.db_path) if os.path.exists(cache.db_path) else 0
+        cache_size_mb = cache_size / (1024 * 1024)
+        
+        return jsonify({
+            'status': '✅ MusicBrainz Integration Active',
+            'cache': {
+                'total_cached_artists': total_artists,
+                'cached_this_week': recent_artists,
+                'artists_with_genres': artists_with_genres,
+                'artists_with_tags': artists_with_tags,
+                'average_rating': round(avg_rating, 1),
+                'cache_file_size_mb': round(cache_size_mb, 2),
+                'cache_retention_days': 30
+            },
+            'performance': {
+                'estimated_cache_hit_rate': f"{min(95, (total_artists / 50) * 100):.0f}%",
+                'avg_new_lookups_per_recommendation': max(1, 5 - int(total_artists / 10))
+            }
+        })
+    except Exception as e:
+        return jsonify({
+            'status': '⚠️ MusicBrainz not available',
+            'error': str(e)
+        }), 500
+
+@app.route('/debug/config')
+def debug_config():
+    """Display current OAuth configuration for debugging"""
+    # Determine mode the same way create_spotify_oauth does
+    is_local = os.getenv('FLASK_ENV') == 'development' or not PUBLIC_URL
+    
+    if is_local:
+        redirect_uri = url_for('redirect_page', _external=True, _scheme='http')
+        mode = "LOCAL DEVELOPMENT"
+    else:
+        redirect_uri = f"{PUBLIC_URL.rstrip('/')}/redirect"
+        mode = "PRODUCTION"
+    
+    # Get what Flask thinks the external URL is
+    flask_external = url_for('redirect_page', _external=True)
+    
+    return jsonify({
+        'status': '✅ Configuration Check',
+        'mode': mode,
+        'redirect_uri': redirect_uri,
+        'flask_env': os.getenv('FLASK_ENV', 'not set'),
+        'public_url': PUBLIC_URL if PUBLIC_URL else 'NOT SET',
+        'flask_detected_url': flask_external,
+        'client_id': CLIENT_ID[:15] + '...' if CLIENT_ID else '❌ NOT SET',
+        'client_secret': '✅ SET' if CLIENT_SECRET else '❌ NOT SET',
+        'instructions': {
+            'step_1': f'Copy this redirect_uri: {redirect_uri}',
+            'step_2': 'Go to https://developer.spotify.com/dashboard',
+            'step_3': 'Click your app → Edit Settings → Redirect URIs',
+            'step_4': f'Add EXACTLY: {redirect_uri}',
+            'step_5': 'Click ADD, then SAVE',
+            'step_6': 'Try logging in again'
+        },
+        'local_development_setup': {
+            'note': 'You are in LOCAL MODE',
+            'make_sure': [
+                'Your .env file has FLASK_ENV=development',
+                'Your .env does NOT have PUBLIC_URL set (or set to http://localhost:5000)',
+                f'Spotify Dashboard has this redirect URI: {redirect_uri}',
+                'You are accessing the app via the same URL (127.0.0.1:5000 or localhost:5000)'
+            ]
+        } if is_local else {
+            'note': 'You are in PRODUCTION MODE',
+            'make_sure': [
+                'PUBLIC_URL environment variable is set correctly',
+                'PUBLIC_URL does not have trailing slash',
+                'PUBLIC_URL uses https:// (not http://)',
+                f'Spotify Dashboard has this redirect URI: {redirect_uri}'
+            ]
+        }
+    })
 
 # Route to display the form for entering client_id and client_secret
 @app.route('/config', methods=['GET', 'POST'])
@@ -151,9 +257,20 @@ def start():
 @app.route('/login')
 def login():
     # Create a SpotifyOAuth instance and get the authorization URL
-    auth_url = create_spotify_oauth().get_authorize_url()
-    # Redirect the user to the authorization URL
-    return redirect(auth_url)
+    try:
+        spotify_oauth = create_spotify_oauth()
+        auth_url = spotify_oauth.get_authorize_url()
+        # Log the redirect URI being used for debugging
+        logger.info(f"Initiating login with redirect_uri: {spotify_oauth.redirect_uri}")
+        # Redirect the user to the authorization URL
+        return redirect(auth_url)
+    except Exception as e:
+        logger.error(f"Error creating Spotify OAuth: {e}")
+        return render_template(
+            'error.html',
+            title='Configuration Error',
+            message=f'Failed to initiate Spotify login. Error: {str(e)}. Please check your app configuration.'
+        ), 500
 
 # Route to handle the redirect URI after authorization
 @app.route('/redirect')
@@ -177,15 +294,53 @@ def redirect_page():
         )
 
     spotify_oauth = create_spotify_oauth()
+    redirect_uri_used = spotify_oauth.redirect_uri
+    
+    logger.info(f"Processing OAuth callback - redirect_uri being used: {redirect_uri_used}")
+    logger.info(f"PUBLIC_URL environment variable: {PUBLIC_URL}")
+    logger.info(f"Authorization code received: {code[:20]}...")
+    
     try:
         # Force token exchange to avoid returning a cached token from another user
         token_info = spotify_oauth.get_access_token(code, check_cache=False)
     except SpotifyOauthError as exc:
-        logger.warning('Failed to exchange Spotify authorization code: %s', exc)
+        error_str = str(exc).lower()
+        logger.error(f'Spotify OAuth Error: {exc}')
+        logger.error(f'Error details - redirect_uri used: {redirect_uri_used}')
+        logger.error(f'Error details - PUBLIC_URL: {PUBLIC_URL}')
+        
+        # Check for redirect URI mismatch specifically
+        if 'redirect_uri' in error_str or 'invalid_request' in error_str:
+            redirect_uri = spotify_oauth.redirect_uri
+            return render_template(
+                'error.html',
+                title='❌ Redirect URI Mismatch',
+                message=(
+                    f'The redirect URI is not registered in your Spotify App.\n\n'
+                    f'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'
+                    f'Current redirect URI:\n'
+                    f'{redirect_uri}\n'
+                    f'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n'
+                    f'FIX THIS NOW:\n\n'
+                    f'1. Go to: https://developer.spotify.com/dashboard\n'
+                    f'2. Click your app name\n'
+                    f'3. Click "Edit Settings" (green button)\n'
+                    f'4. Scroll to "Redirect URIs"\n'
+                    f'5. Copy and paste this EXACT URI:\n'
+                    f'   {redirect_uri}\n'
+                    f'6. Click "ADD"\n'
+                    f'7. Click "SAVE" at the bottom\n\n'
+                    f'Then refresh this page and try again.\n\n'
+                    f'DEBUG INFO:\n'
+                    f'PUBLIC_URL: {PUBLIC_URL or "NOT SET"}\n'
+                    f'Error: {exc}'
+                )
+            ), 400
+        
         return render_template(
             'error.html',
             title='Authorization Failed',
-            message='Spotify rejected the authorization code. Please restart the sign-in flow and try again.'
+            message=f'Spotify rejected the authorization code. Error: {exc}\n\nPlease restart the sign-in flow and try again.'
         ), 400
     except (ConnectionError, TimeoutError):
         logger.exception('Network error during Spotify authorization')
@@ -471,17 +626,31 @@ def get_token():
     
     return token_info
 
-def create_spotify_oauth():
+def create_spotify_oauth(client_id=None, client_secret=None):
     # Use an in-memory cache so tokens do not leak across different user sessions
-    redirect_uri = url_for('redirect_page', _external=True)
-    if PUBLIC_URL:
-        # Build redirect using the public base URL to avoid proxy scheme mismatches
-        redirect_uri = urljoin(PUBLIC_URL.rstrip('/') + '/', url_for('redirect_page', _external=False).lstrip('/'))
+    # Construct redirect URI carefully to match Spotify Dashboard settings
+    
+    # Determine if running locally or in production
+    is_local = os.getenv('FLASK_ENV') == 'development' or not PUBLIC_URL
+    
+    if is_local:
+        # Local development: Use Flask's url_for to get the actual host
+        # This will be http://127.0.0.1:5000/redirect or http://localhost:5000/redirect
+        redirect_uri = url_for('redirect_page', _external=True, _scheme='http')
+        logger.info(f"🏠 LOCAL MODE - Using redirect URI: {redirect_uri}")
+    else:
+        # Production: Use the configured PUBLIC_URL
+        base_url = PUBLIC_URL.rstrip('/')
+        redirect_uri = f"{base_url}/redirect"
+        logger.info(f"🌐 PRODUCTION MODE - Using redirect URI: {redirect_uri}")
+    
+    logger.info(f"Environment: FLASK_ENV={os.getenv('FLASK_ENV')}, PUBLIC_URL={PUBLIC_URL}")
+    
     return SpotifyOAuth(
-        client_id=CLIENT_ID,
-        client_secret=CLIENT_SECRET,
+        client_id=client_id or CLIENT_ID,
+        client_secret=client_secret or CLIENT_SECRET,
         redirect_uri=redirect_uri,
-        scope='user-library-read playlist-modify-public playlist-modify-private',
+        scope='user-library-read playlist-modify-public playlist-modify-private user-top-read',
         cache_handler=MemoryCacheHandler()
     )
 
@@ -490,7 +659,12 @@ def create_spotify_oauth():
 @app.route('/recommendations')
 def recommendations_page():
     """Display the recommendations dashboard"""
-    token_info = get_token()
+    try:
+        token_info = get_token()
+    except Exception:
+        # User not logged in - redirect to login
+        return redirect('/login')
+    
     if not token_info:
         return redirect('/login')
     return render_template('recommendations.html')
@@ -590,46 +764,92 @@ def generate_recommendations():
         use_audio_features = data.get('use_audio_features', True)
         public = data.get('public', True)
         
-        # Get analysis from cache or run new analysis
+        # Get user preferences
+        preferences = {
+            'mood': data.get('mood', 'any'),
+            'era': data.get('era', 'any'),
+            'discovery': int(data.get('discovery', 50))  # 0-100, default 50
+        }
+        
+        logger.info("User preferences: mood=%s, era=%s, discovery=%d", 
+                   preferences['mood'], preferences['era'], preferences['discovery'])
+        
+        # ALWAYS run fresh analysis (cache disabled)
         user_id = session.get('user_id')
         if not user_id:
             user_profile = sp.current_user()
             user_id = user_profile['id']
             session['user_id'] = user_id
         
-        cache_key = session.get('analysis_cache_key')
-        analysis = get_analysis_from_cache(cache_key) if cache_key else {}
+        # Cache is disabled - always run fresh analysis
+        logger.info("="*60)
+        logger.info("FLASK: Starting fresh analysis (cache disabled)")
+        logger.info("User ID: %s", user_id)
+        logger.info("="*60)
         
-        if not analysis or analysis.get('error'):
-            logger.info("No cached analysis found, running FAST analysis for recommendations")
-            analyzer = MusicTasteAnalyzer(sp, request_timeout=2)
-            try:
-                # MINIMAL analysis: 15 liked songs only, no playlists
-                analysis = analyzer.analyze_taste(
-                    include_playlists=False,  # NEVER use playlists here
-                    playlist_limit=0,
-                    tracks_per_playlist=0,
-                    liked_songs_limit=15,  # Only 15 liked songs (fast)
-                    max_analysis_time=15  # 15 second hard limit
-                )
-            except TimeoutException as e:
-                logger.error("=== TIMEOUT === During recommendation analysis: %s", e)
-                return jsonify({'error': 'Analysis timeout. Please try the analyze button first.'}), 408
-            # Save new analysis to cache
-            cache_key = save_analysis_to_cache(user_id, analysis)
-            if cache_key:
-                session['analysis_cache_key'] = cache_key
+        analyzer = MusicTasteAnalyzer(sp, request_timeout=2)
+        try:
+            # MINIMAL analysis: 15 liked songs only, no playlists
+            analysis = analyzer.analyze_taste(
+                include_playlists=False,  # NEVER use playlists here
+                playlist_limit=0,
+                tracks_per_playlist=0,
+                liked_songs_limit=15,  # Only 15 liked songs (fast)
+                max_analysis_time=15  # 15 second hard limit
+            )
+            logger.info("="*60)
+            logger.info("FLASK: Analysis complete")
+            logger.info("Result: track_count=%s, unique_artists=%s, genres=%s", 
+                       analysis.get('track_count'),
+                       analysis.get('unique_artists'),
+                       len(analysis.get('top_genres', [])))
+            logger.info("Top artist IDs: %s", analysis.get('top_artist_ids', [])[:3])
+            logger.info("Genre seeds: %s", analysis.get('genre_seeds', [])[:5])
+            logger.info("="*60)
+        except TimeoutException as e:
+            logger.error("=== TIMEOUT === During recommendation analysis: %s", e)
+            return jsonify({'error': 'Analysis timeout. Please try again.'}), 408
+        
+        # Check if analysis has errors (but still try to generate recommendations)
+        if analysis.get('error') and not analysis.get('top_artist_ids'):
+            return jsonify({'error': analysis.get('error', 'Analysis failed')}), 400
+        
+        # Disable audio features if they failed (403 errors)
+        has_audio_features = bool(analysis.get('avg_audio_features'))
+        if not has_audio_features and use_audio_features:
+            logger.warning("Audio features not available (403 error) - generating recommendations without them")
+            use_audio_features = False
         
         # Generate recommendations
+        logger.info("="*60)
+        logger.info("FLASK: Generating recommendations")
+        logger.info("Parameters: limit=%d, use_audio_features=%s, public=%s", 
+                   track_limit, use_audio_features, public)
+        logger.info("="*60)
+        
         engine = RecommendationEngine(sp)
         recommendations = engine.generate_recommendations(
             analysis=analysis,
             limit=track_limit,
-            include_audio_targets=use_audio_features
+            include_audio_targets=use_audio_features,
+            preferences=preferences
         )
         
+        logger.info("="*60)
+        logger.info("FLASK: Recommendation generation complete")
+        logger.info("Recommendations received: %d tracks", len(recommendations))
+        logger.info("="*60)
+        
         if not recommendations:
-            return jsonify({'error': 'No recommendations could be generated'}), 400
+            error_msg = 'No recommendations could be generated. '
+            if not analysis.get('top_artist_ids'):
+                error_msg += 'Unable to find artists from your library. Please add more liked songs to your Spotify account.'
+            elif not analysis.get('genre_seeds'):
+                error_msg += 'Unable to determine music genres. Try adding more varied music to your library.'
+            else:
+                error_msg += 'The Spotify API did not return any recommendations. Try different settings or add your email to the Spotify Developer Dashboard allowed users list.'
+            logger.error("No recommendations generated: %s", error_msg)
+            return jsonify({'error': error_msg}), 400
         
         # Create playlist
         result = engine.create_recommendation_playlist(
@@ -651,8 +871,10 @@ def generate_recommendations():
             if e.http_status == 429:
                 error_message = 'Rate limit exceeded. Please wait a moment and try again.'
             elif e.http_status == 403:
-                error_message = 'Permission denied. Please ensure the app has the required permissions.'
-        return jsonify({'error': error_message, 'details': str(e)}), 500
+                error_message = ('Permission denied by Spotify. Your app is in Development Mode. '
+                               'Go to https://developer.spotify.com/dashboard → Your App → Settings → Users and Access '
+                               '→ Add your Spotify email address to the allowed users list.')
+        return jsonify({'error': error_message, 'details': str(e) if app.debug else None}), 500
     except (ConnectionError, TimeoutError) as e:
         logger.error("Network error during recommendation generation: %s", e)
         return jsonify({'error': 'Network error. Please check your connection and try again.'}), 500
@@ -662,4 +884,6 @@ def generate_recommendations():
 
 if __name__ == '__main__':
     debug_mode = os.getenv('FLASK_ENV') != 'production'
-    app.run(debug=debug_mode)
+    # Use port 8000 for local development to avoid conflicts with macOS AirPlay Receiver
+    port = int(os.getenv('PORT', 8000))
+    app.run(debug=debug_mode, port=port, host='127.0.0.1')

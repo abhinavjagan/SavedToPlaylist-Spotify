@@ -6,3 +6,6 @@ __pycache__/
 /.pytest_cache
 /.vscode
 tokens.db
+musicbrainz_cache.db
+*.db
+flask_server.log

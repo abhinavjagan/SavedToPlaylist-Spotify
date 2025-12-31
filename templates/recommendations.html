@@ -211,6 +211,41 @@
             cursor: pointer;
         }
         
+        .form-group input[type="range"] {
+            width: 100%;
+            height: 8px;
+            border-radius: 5px;
+            background: linear-gradient(to right, rgba(29, 185, 84, 0.3) 0%, rgba(29, 185, 84, 0.8) 100%);
+            outline: none;
+            opacity: 0.9;
+            transition: opacity 0.2s;
+            cursor: pointer;
+        }
+        
+        .form-group input[type="range"]:hover {
+            opacity: 1;
+        }
+        
+        .form-group input[type="range"]::-webkit-slider-thumb {
+            appearance: none;
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            background: #1DB954;
+            cursor: pointer;
+            box-shadow: 0 2px 8px rgba(29, 185, 84, 0.5);
+        }
+        
+        .form-group input[type="range"]::-moz-range-thumb {
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            background: #1DB954;
+            cursor: pointer;
+            box-shadow: 0 2px 8px rgba(29, 185, 84, 0.5);
+            border: none;
+        }
+        
         .btn-generate {
             background: linear-gradient(135deg, #1DB954 0%, #1ed760 100%);
             color: #000;
@@ -369,6 +404,40 @@
                            min="10" max="100" value="20" required>
                 </div>
                 
+                <div class="form-group">
+                    <label for="moodFilter">🎭 Mood Filter</label>
+                    <select id="moodFilter" name="moodFilter">
+                        <option value="any">Any Mood</option>
+                        <option value="chill">Chill / Relaxed</option>
+                        <option value="energetic">Energetic / Upbeat</option>
+                        <option value="sad">Melancholic / Sad</option>
+                        <option value="happy">Happy / Positive</option>
+                    </select>
+                </div>
+                
+                <div class="form-group">
+                    <label for="eraFilter">📅 Era Preference</label>
+                    <select id="eraFilter" name="eraFilter">
+                        <option value="any">Any Era</option>
+                        <option value="2020s">2020s</option>
+                        <option value="2010s">2010s</option>
+                        <option value="2000s">2000s</option>
+                        <option value="90s">90s</option>
+                        <option value="80s">80s and Earlier</option>
+                    </select>
+                </div>
+                
+                <div class="form-group">
+                    <label for="discoverySlider">🔍 Discovery Level: <span id="discoveryValue">50</span>%</label>
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 5px; font-size: 12px; color: #b3b3b3;">
+                        <span>Familiar</span>
+                        <span>Balanced</span>
+                        <span>Discovery</span>
+                    </div>
+                    <input type="range" id="discoverySlider" name="discoverySlider" 
+                           min="0" max="100" value="50" style="width: 100%;">
+                </div>
+                
                 <div class="checkbox-group">
                     <input type="checkbox" id="includePlaylists" name="includePlaylists">
                     <label for="includePlaylists">⚠️ Include playlists (HIGH TIMEOUT RISK - not recommended)</label>
@@ -397,6 +466,14 @@
     <script>
         let analysisData = null;
         
+        // Update discovery slider value display
+        const discoverySlider = document.getElementById('discoverySlider');
+        const discoveryValue = document.getElementById('discoveryValue');
+        
+        discoverySlider.addEventListener('input', function() {
+            discoveryValue.textContent = this.value;
+        });
+        
         document.getElementById('recommendationForm').addEventListener('submit', async function(e) {
             e.preventDefault();
             
@@ -417,7 +494,11 @@
                 track_limit: parseInt(document.getElementById('trackLimit').value),
                 include_playlists: document.getElementById('includePlaylists').checked,
                 use_audio_features: document.getElementById('useAudioFeatures').checked,
-                public: document.getElementById('publicPlaylist').checked
+                public: document.getElementById('publicPlaylist').checked,
+                // NEW: User preferences
+                mood: document.getElementById('moodFilter').value,
+                era: document.getElementById('eraFilter').value,
+                discovery: parseInt(document.getElementById('discoverySlider').value)
             };
             
             try {
@@ -433,7 +514,8 @@
                 });
                 
                 if (!analyzeResponse.ok) {
-                    throw new Error('Failed to analyze music taste');
+                    const errorData = await analyzeResponse.json();
+                    throw new Error(errorData.error || 'Failed to analyze music taste');
                 }
                 
                 analysisData = await analyzeResponse.json();
@@ -460,7 +542,8 @@
                 });
                 
                 if (!recommendResponse.ok) {
-                    throw new Error('Failed to generate recommendations');
+                    const errorData = await recommendResponse.json();
+                    throw new Error(errorData.error || errorData.details || 'Failed to generate recommendations');
                 }
                 
                 const result = await recommendResponse.json();
@@ -490,7 +573,17 @@
             } catch (error) {
                 console.error('Error:', error);
                 statusMsg.className = 'status-message error';
-                statusMsg.textContent = `❌ Error: ${error.message}`;
+                
+                let errorMessage = error.message;
+                
+                // Add helpful context for common errors
+                if (errorMessage.includes('403') || errorMessage.includes('Permission denied')) {
+                    errorMessage += '\n\n💡 Tip: Make sure you added your Spotify email to the allowed users in your Spotify Developer Dashboard.';
+                } else if (errorMessage.includes('No recommendations')) {
+                    errorMessage += '\n\n💡 Tip: Try adding more liked songs to your Spotify library.';
+                }
+                
+                statusMsg.textContent = `❌ Error: ${errorMessage}`;
                 statusMsg.style.display = 'block';
                 
                 btn.innerHTML = '🎵 Analyze & Generate Playlist';
