@@ -5,9 +5,11 @@ import os
 import threading
 import uuid
 import sqlite3
+import logging
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from spotipy.cache_handler import MemoryCacheHandler
+from spotipy.exceptions import SpotifyException, SpotifyOauthError
 from urllib.parse import urljoin
 from flask import Flask, request, url_for, session, redirect, render_template, jsonify
 from dotenv import load_dotenv
@@ -31,6 +33,7 @@ NEED_CREDS = False
 PUBLIC_URL = os.getenv('PUBLIC_URL')
 if PUBLIC_URL and PUBLIC_URL.startswith('https://'):
     app.config['PREFERRED_URL_SCHEME'] = 'https'
+logger = logging.getLogger(__name__)
 
 # In-memory job store for development. Replace with a DB or cache for production.
 JOBS = {}
@@ -105,31 +108,81 @@ def login():
 # Route to handle the redirect URI after authorization
 @app.route('/redirect')
 def redirect_page():
-    # Get the authorization code from the request parameters
+    error = request.args.get('error')
+    if error:
+        logger.warning('Spotify authorization returned error=%s', error)
+        return render_template(
+            'error.html',
+            title='Spotify Authorization Error',
+            message='Spotify reported an error while authorizing your account. Please try again.'
+        )
+
     code = request.args.get('code')
-    # Exchange the authorization code for an access token and refresh token
+    if not code:
+        logger.warning('Spotify redirect missing code. Params=%s', dict(request.args))
+        return render_template(
+            'error.html',
+            title='Missing Authorization Code',
+            message='We did not receive the authorization code from Spotify. Please start the sign-in again.'
+        )
+
     spotify_oauth = create_spotify_oauth()
-    # Force token exchange to avoid returning a cached token from another user
-    token_info = spotify_oauth.get_access_token(code, check_cache=False)
-    
-    # Get the current user info BEFORE clearing session
-    sp = spotipy.Spotify(auth=token_info['access_token'])
     try:
+        # Force token exchange to avoid returning a cached token from another user
+        token_info = spotify_oauth.get_access_token(code, check_cache=False)
+    except SpotifyOauthError as exc:
+        logger.warning('Failed to exchange Spotify authorization code: %s', exc)
+        return render_template(
+            'error.html',
+            title='Authorization Failed',
+            message='Spotify rejected the authorization code. Please restart the sign-in flow and try again.'
+        ), 400
+    except Exception as exc:
+        logger.exception('Unexpected error exchanging Spotify authorization code')
+        return render_template(
+            'error.html',
+            title='Authorization Failed',
+            message='We could not complete the Spotify login. Please start over and try again.'
+        ), 500
+
+    try:
+        sp = spotipy.Spotify(auth=token_info['access_token'])
         user_info = sp.current_user()
         user_id = user_info['id']
-    except Exception as e:
-        return redirect(url_for('start'))  # Redirect to start if auth fails
-    
-    # Now clear and set fresh session data for this specific user
+    except SpotifyException as exc:
+        logger.warning('Spotify profile lookup failed: %s', exc)
+        message = 'We could not read your Spotify profile after authorizing. Please retry the login.'
+        if getattr(exc, 'http_status', None) == 403 and 'user may not be registered' in str(exc).lower():
+            message = (
+                "Spotify reports this account is not approved for the app yet. "
+                "Add the user under Users and Access in developer.spotify.com before retrying."
+            )
+        return render_template(
+            'error.html',
+            title='Profile Lookup Failed',
+            message=message
+        ), 403
+    except Exception as exc:
+        logger.exception('Failed to fetch Spotify profile for authenticated user')
+        return render_template(
+            'error.html',
+            title='Profile Lookup Failed',
+            message='We could not read your Spotify profile after authorizing. Please retry the login.'
+        ), 500
+
+    playlist_name = session.get('playlist_name')
+    playlist_public = session.get('playlist_public', True)
+
     session.clear()
     session[TOKEN_INFO] = token_info
     session['user_id'] = user_id
-    
-    # Save refresh token to DB for persistence across sessions
+    if playlist_name:
+        session['playlist_name'] = playlist_name
+        session['playlist_public'] = playlist_public
+
     if token_info.get('refresh_token'):
         save_refresh_token(user_id, token_info.get('refresh_token'))
-    
-    # Redirect the user to the progress page which will start the background job
+
     return redirect(url_for('progress'))
 
 
@@ -207,6 +260,15 @@ def create_playlist_job(job_id, expected_user_id, token_info, playlist_name, pla
         JOBS[job_id]['playlist_url'] = new_playlist_url
         JOBS[job_id]['playlist_name'] = playlist_name
         
+    except SpotifyException as exc:
+        JOBS[job_id]['status'] = 'error'
+        message = str(exc)
+        if getattr(exc, 'http_status', None) == 403 and 'user may not be registered' in str(exc).lower():
+            message = (
+                'Spotify blocked the playlist creation because this account is not added '
+                'as a tester for the app in developer.spotify.com.'
+            )
+        JOBS[job_id]['message'] = message
     except Exception as e:
         JOBS[job_id]['status'] = 'error'
         JOBS[job_id]['message'] = str(e)
