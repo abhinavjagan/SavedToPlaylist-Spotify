@@ -7,6 +7,7 @@ import uuid
 import sqlite3
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
+from spotipy.cache_handler import MemoryCacheHandler
 from flask import Flask, request, url_for, session, redirect, render_template, jsonify
 from dotenv import load_dotenv
 
@@ -25,6 +26,7 @@ app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.secret_key = os.getenv('SECRET_KEY') or os.urandom(24)
 TOKEN_INFO = 'token_info'
+NEED_CREDS = False
 
 # In-memory job store for development. Replace with a DB or cache for production.
 JOBS = {}
@@ -103,7 +105,8 @@ def redirect_page():
     code = request.args.get('code')
     # Exchange the authorization code for an access token and refresh token
     spotify_oauth = create_spotify_oauth()
-    token_info = spotify_oauth.get_access_token(code)
+    # Force token exchange to avoid returning a cached token from another user
+    token_info = spotify_oauth.get_access_token(code, check_cache=False)
     
     # Get the current user info BEFORE clearing session
     sp = spotipy.Spotify(auth=token_info['access_token'])
@@ -331,12 +334,13 @@ def get_token():
     return token_info
 
 def create_spotify_oauth(client_id=None, client_secret=None):
-    # Use server-side Spotify app credentials
+    # Use an in-memory cache so tokens do not leak across different user sessions
     return SpotifyOAuth(
         client_id=CLIENT_ID,
         client_secret=CLIENT_SECRET,
         redirect_uri=url_for('redirect_page', _external=True),
-        scope='user-library-read playlist-modify-public playlist-modify-private'
+        scope='user-library-read playlist-modify-public playlist-modify-private',
+        cache_handler=MemoryCacheHandler()
     )
 
 if __name__ == '__main__':
